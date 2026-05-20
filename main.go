@@ -30,14 +30,15 @@ var version = "1.1.0"
 // Using json.Marshal on a struct ensures proper escaping of all special
 // characters, preventing JSON log injection vulnerabilities.
 type LogEntry struct {
-        Timestamp  string `json:"ts"`
-        SourceIP   string `json:"src_ip"`
-        SourcePort int    `json:"src_port"`
-        DestPort   int    `json:"dst_port"`
-        Proto      string `json:"proto"`
-        Size       int    `json:"size"`
-        Printable  string `json:"printable"` // json.Marshal handles escaping
-        Hex        string `json:"hex"`
+        Timestamp     string `json:"ts"`
+        SourceIP      string `json:"src_ip"`
+        SourcePort    int    `json:"src_port"`
+        DestPort      int    `json:"dst_port"`
+        Proto         string `json:"proto"`
+        Size          int    `json:"size"`
+        Printable     string `json:"printable"`          // json.Marshal handles escaping
+        Hex           string `json:"hex"`
+        PayloadSHA256 string `json:"payload_sha256,omitempty"` // SHA256 hash for threat intel
 }
 
 func main() {
@@ -295,14 +296,15 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
 
                 // Write to log using typed struct for proper JSON escaping
                 logEntry := LogEntry{
-                        Timestamp:  event.Timestamp.UTC().Format(time.RFC3339),
-                        SourceIP:   event.SourceIP,
-                        SourcePort: event.SourcePort,
-                        DestPort:   port,
-                        Proto:      event.Proto,
-                        Size:       event.Size,
-                        Printable:  event.Printable, // json.Marshal will escape correctly
-                        Hex:        event.Hex,
+                        Timestamp:     event.Timestamp.UTC().Format(time.RFC3339),
+                        SourceIP:      event.SourceIP,
+                        SourcePort:    event.SourcePort,
+                        DestPort:      port,
+                        Proto:         event.Proto,
+                        Size:          event.Size,
+                        Printable:     event.Printable, // json.Marshal will escape correctly
+                        Hex:           event.Hex,
+                        PayloadSHA256: event.PayloadSHA256,
                 }
 
                 if err := log.WriteEventTyped(logEntry); err != nil {

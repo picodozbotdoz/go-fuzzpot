@@ -1,6 +1,7 @@
 package capture
 
 import (
+        "crypto/sha256"
         "encoding/hex"
         "encoding/json"
         "fmt"
@@ -10,15 +11,16 @@ import (
 
 // Event represents a single captured payload from an attacker.
 type Event struct {
-        Timestamp time.Time `json:"timestamp"`
-        SourceIP  string    `json:"source_ip"`
-        SourcePort int      `json:"source_port"`
-        DestPort  int       `json:"dest_port"`
-        Proto     string    `json:"proto"`     // "tcp"
-        Size      int       `json:"size"`      // bytes received
-        Hex       string    `json:"hex"`       // hex dump of payload
-        Printable string    `json:"printable"` // printable ASCII portion
-        Raw       []byte    `json:"-"`
+        Timestamp     time.Time `json:"timestamp"`
+        SourceIP      string    `json:"source_ip"`
+        SourcePort    int       `json:"source_port"`
+        DestPort      int       `json:"dest_port"`
+        Proto         string    `json:"proto"`              // "tcp"
+        Size          int       `json:"size"`               // bytes received
+        Hex           string    `json:"hex"`                // hex dump of payload
+        Printable     string    `json:"printable"`          // printable ASCII portion
+        PayloadSHA256 string    `json:"payload_sha256,omitempty"` // SHA256 hash for threat intel
+        Raw           []byte    `json:"-"`
 }
 
 func (e Event) String() string {
@@ -67,15 +69,23 @@ func Capture(conn net.Conn, timeout time.Duration, maxLen int) Event {
                 }
         }
 
+        // Compute SHA256 of payload for threat intel deduplication and IOC sharing
+        var payloadSHA string
+        if len(buf) > 0 {
+                shaSum := sha256.Sum256(buf)
+                payloadSHA = hex.EncodeToString(shaSum[:])
+        }
+
         return Event{
-                Timestamp:  time.Now(),
-                SourceIP:   remote.IP.String(),
-                SourcePort: remote.Port,
-                Proto:      "tcp",
-                Size:       len(buf),
-                Hex:        hex.EncodeToString(buf),
-                Printable:  extractPrintable(buf),
-                Raw:        buf,
+                Timestamp:     time.Now(),
+                SourceIP:      remote.IP.String(),
+                SourcePort:    remote.Port,
+                Proto:         "tcp",
+                Size:          len(buf),
+                Hex:           hex.EncodeToString(buf),
+                Printable:     extractPrintable(buf),
+                PayloadSHA256: payloadSHA,
+                Raw:           buf,
         }
 }
 
