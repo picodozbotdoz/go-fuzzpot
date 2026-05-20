@@ -24,6 +24,20 @@ import (
 
 var version = "1.1.0"
 
+// LogEntry is a typed struct for JSON log serialization.
+// Using json.Marshal on a struct ensures proper escaping of all special
+// characters, preventing JSON log injection vulnerabilities.
+type LogEntry struct {
+        Timestamp  string `json:"ts"`
+        SourceIP   string `json:"src_ip"`
+        SourcePort int    `json:"src_port"`
+        DestPort   int    `json:"dst_port"`
+        Proto      string `json:"proto"`
+        Size       int    `json:"size"`
+        Printable  string `json:"printable"` // json.Marshal handles escaping
+        Hex        string `json:"hex"`
+}
+
 func main() {
         cfgPath := flag.String("config", "config/config.yaml", "path to config file")
         dryRun := flag.Bool("dry-run", false, "show target ports and exit without listening")
@@ -254,19 +268,19 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
                 stats.payloads++
                 stats.mu.Unlock()
 
-                // Write to log
-                logEntry := map[string]interface{}{
-                        "ts":         event.Timestamp.Format("2006-01-02T15:04:05.000Z07:00"),
-                        "src_ip":     event.SourceIP,
-                        "src_port":   event.SourcePort,
-                        "dst_port":   port,
-                        "proto":      event.Proto,
-                        "size":       event.Size,
-                        "printable":  event.Printable,
-                        "hex":        event.Hex,
+                // Write to log using typed struct for proper JSON escaping
+                logEntry := LogEntry{
+                        Timestamp:  event.Timestamp.UTC().Format(time.RFC3339),
+                        SourceIP:   event.SourceIP,
+                        SourcePort: event.SourcePort,
+                        DestPort:   port,
+                        Proto:      event.Proto,
+                        Size:       event.Size,
+                        Printable:  event.Printable, // json.Marshal will escape correctly
+                        Hex:        event.Hex,
                 }
 
-                if err := log.WriteEvent(logEntry); err != nil {
+                if err := log.WriteEventTyped(logEntry); err != nil {
                         fmt.Fprintf(os.Stderr, "  [!] log write error: %v\n", err)
                         stats.mu.Lock()
                         stats.errors++

@@ -77,6 +77,30 @@ func (l *Logger) WriteEvent(event map[string]interface{}) error {
         return err
 }
 
+// WriteEventTyped appends a JSON-line event to the log file using a typed struct.
+// This is preferred over WriteEvent as json.Marshal on structs guarantees proper
+// escaping of all special characters, preventing JSON log injection.
+func (l *Logger) WriteEventTyped(event interface{}) error {
+        l.mu.Lock()
+        defer l.mu.Unlock()
+
+        if l.rotSize > 0 && l.written >= l.rotSize {
+                if err := l.rotate(); err != nil {
+                        return err
+                }
+        }
+
+        line, err := json.Marshal(event)
+        if err != nil {
+                return fmt.Errorf("marshal event: %w", err)
+        }
+        line = append(line, '\n')
+
+        n, err := l.file.Write(line)
+        l.written += int64(n)
+        return err
+}
+
 // WriteRaw writes a raw string line to the log.
 func (l *Logger) WriteRaw(line string) error {
         l.mu.Lock()
