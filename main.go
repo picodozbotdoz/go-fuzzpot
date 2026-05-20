@@ -16,6 +16,8 @@ import (
         "time"
         "unicode/utf8"
 
+        "golang.org/x/sys/unix"
+
         "fuzzpot/capture"
         "fuzzpot/config"
         "fuzzpot/logger"
@@ -122,9 +124,21 @@ func main() {
         }()
 
         // Connection limiter — prevent goroutine explosion under flood.
-        // MaxConcurrent limits how many handleConnection goroutines run at once.
-        // Beyond this, Accept() still works but connections are immediately closed.
-        const maxConcurrent = 4096
+        // Dynamically set maxConcurrent based on system file descriptor limit
+        // to prevent DoS from exhausting all available FDs.
+        var maxConcurrent int
+        var rlimit unix.Rlimit
+        if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit); err == nil && rlimit.Cur > 0 {
+                maxConcurrent = int(rlimit.Cur / 2) // Use half of available FDs
+                if maxConcurrent < 100 {
+                        maxConcurrent = 100 // Minimum safe value
+                }
+                if maxConcurrent > 4096 {
+                        maxConcurrent = 4096 // Cap at reasonable default
+                }
+        } else {
+                maxConcurrent = 256 // Conservative default if we can't determine limit
+        }
         connSem := make(chan struct{}, maxConcurrent)
         // Stats
         var stats struct {
