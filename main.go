@@ -64,6 +64,14 @@ func main() {
         }
         defer log.Close()
 
+        // Setup security logger for incident response
+        secLog, err := logger.NewSecurityLogger(cfg.Logging.Dir)
+        if err != nil {
+                fmt.Fprintf(os.Stderr, "security logger init: %v\n", err)
+                os.Exit(1)
+        }
+        defer secLog.Close()
+
         // Build port ranges from config
         var ranges [][2]int
         for _, r := range cfg.Ports.Ranges {
@@ -170,7 +178,7 @@ func main() {
                         break
                 }
                 go func() {
-                        err := listenPort(ctx, p, cfg, pm, log, &stats, connSem)
+                        err := listenPort(ctx, p, cfg, pm, log, secLog, &stats, connSem)
                         if err != nil && ctx.Err() == nil {
                                 stats.mu.Lock()
                                 stats.errors++
@@ -199,6 +207,7 @@ func main() {
                 case <-ticker.C:
                         conflicts := pm.DetectConflicts()
                         if len(conflicts) > 0 {
+                                secLog.LogConflict(conflicts)
                                 fmt.Printf("  [!] %d port conflicts detected (claimed by system): %v\n",
                                         len(conflicts), conflicts)
                                 // Note: closed listeners auto-recover on next restart.
@@ -215,6 +224,7 @@ func listenPort(
         cfg *config.Config,
         pm *portscan.PortManager,
         log *logger.Logger,
+        secLog *logger.SecurityLogger,
         stats *struct {
                 mu          sync.Mutex
                 connections int64
@@ -258,6 +268,7 @@ func listenPort(
                         go handleConnection(conn, port, cfg, log, stats, connSem)
                 default:
                         // At capacity — close immediately, log throttle event
+                        secLog.LogThrottled(conn.RemoteAddr().String(), port)
                         atomic.AddInt64(&stats.throttled, 1)
                         conn.Close()
                 }
