@@ -6,6 +6,7 @@ import (
         "io"
         "os"
         "path/filepath"
+        "regexp"
         "sort"
         "sync"
         "time"
@@ -144,20 +145,31 @@ func copyThenTruncate(src, dst string) error {
 }
 
 // pruneOldLogs removes the oldest rotated log files when maxFiles is exceeded.
+// Only matches files with the expected timestamp suffix format (YYYYMMDD-HHMMSS).
 func (l *Logger) pruneOldLogs() {
         pattern := l.logPath + ".*"
         matches, err := filepath.Glob(pattern)
         if err != nil {
                 return
         }
-        if len(matches) <= l.maxFiles {
+
+        // Only keep files that match the expected rotation timestamp format
+        rotatedPattern := regexp.MustCompile(`\.\d{8}-\d{6}$`)
+        var validMatches []string
+        for _, m := range matches {
+                if rotatedPattern.MatchString(m) {
+                        validMatches = append(validMatches, m)
+                }
+        }
+
+        if len(validMatches) <= l.maxFiles {
                 return
         }
 
         // Sort by modification time (oldest first)
-        sort.Slice(matches, func(i, j int) bool {
-                fi, _ := os.Stat(matches[i])
-                fj, _ := os.Stat(matches[j])
+        sort.Slice(validMatches, func(i, j int) bool {
+                fi, _ := os.Stat(validMatches[i])
+                fj, _ := os.Stat(validMatches[j])
                 if fi == nil || fj == nil {
                         return false
                 }
@@ -165,9 +177,9 @@ func (l *Logger) pruneOldLogs() {
         })
 
         // Remove oldest files to get back under the cap
-        toRemove := len(matches) - l.maxFiles
+        toRemove := len(validMatches) - l.maxFiles
         for i := 0; i < toRemove; i++ {
-                os.Remove(matches[i])
+                os.Remove(validMatches[i])
         }
 }
 
