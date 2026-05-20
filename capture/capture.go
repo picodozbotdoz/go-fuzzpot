@@ -80,7 +80,11 @@ func Capture(conn net.Conn, timeout time.Duration, maxLen int) Event {
 }
 
 func extractPrintable(data []byte) string {
-        var b []byte
+        cap_ := len(data)
+        if cap_ > 256 {
+                cap_ = 256
+        }
+        b := make([]byte, 0, cap_)
         for _, c := range data {
                 if c >= 32 && c <= 126 {
                         b = append(b, c)
