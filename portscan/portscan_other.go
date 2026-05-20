@@ -8,10 +8,12 @@ import (
         "sync"
 )
 
-// GetUsedPorts uses a net.Listen probe as cross-platform fallback.
-// It briefly attempts to bind each port to check if it's in use.
-// This is slower than platform-specific methods but works everywhere.
-func GetUsedPorts() map[int]bool {
+func init() {
+        GetUsedPorts = getUsedPortsOther
+}
+
+// getUsedPortsOther uses a net.Listen probe as cross-platform fallback.
+func getUsedPortsOther() map[int]bool {
         return probeUsedPorts(probeDefaultRanges())
 }
 
