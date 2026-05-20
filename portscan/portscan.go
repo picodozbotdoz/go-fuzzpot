@@ -34,10 +34,16 @@ func NewPortManager(exclude []int) *PortManager {
 
 // TargetPorts returns the ports we should listen on:
 // union of all configured ranges, minus used ports, minus excludes, minus ephemeral.
+// FIX: Acquire lock BEFORE reading used ports to prevent TOCTOU race.
 func (pm *PortManager) TargetPorts(ranges [][2]int) []int {
-        used := GetUsedPorts()
+        // Acquire lock BEFORE reading used ports to ensure consistency
         pm.mu.Lock()
-        defer pm.mu.Unlock()
+
+        // Snapshot used ports while holding lock
+        used := GetUsedPorts()
+
+        // Also snapshot ephemeral range
+        ephLo, ephHi := pm.ephLo, pm.ephHi
 
         result := make(map[int]struct{})
         for _, r := range ranges {
@@ -48,7 +54,7 @@ func (pm *PortManager) TargetPorts(ranges [][2]int) []int {
                         if _, ok := pm.excludePorts[p]; ok {
                                 continue
                         }
-                        if IsEphemeral(p, pm.ephLo, pm.ephHi) {
+                        if IsEphemeral(p, ephLo, ephHi) {
                                 continue
                         }
                         result[p] = struct{}{}
@@ -59,6 +65,8 @@ func (pm *PortManager) TargetPorts(ranges [][2]int) []int {
         for p := range result {
                 ports = append(ports, p)
         }
+
+        pm.mu.Unlock() // Unlock after all reads complete
         return ports
 }
 
@@ -85,10 +93,10 @@ func (pm *PortManager) ListeningCount() int {
 
 // DetectConflicts checks if any of our listen ports have been claimed
 // by a new system service. Returns ports that should be released.
+// FIX: Snapshot used ports inside lock to prevent TOCTOU race.
 func (pm *PortManager) DetectConflicts() []int {
+        pm.mu.Lock()
         used := GetUsedPorts()
-        pm.mu.RLock()
-        defer pm.mu.RUnlock()
 
         var conflicts []int
         for p := range pm.listenPorts {
@@ -96,6 +104,7 @@ func (pm *PortManager) DetectConflicts() []int {
                         conflicts = append(conflicts, p)
                 }
         }
+        pm.mu.Unlock()
         return conflicts
 }
 
