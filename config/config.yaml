@@ -22,6 +22,8 @@ capture:
 logging:
   dir: /var/log/fuzzpot
   file: payloads.log
+  rotate_mb: 50         # rotate individual log file after this many MB
+  keep_files: 10        # keep at most this many rotated files (0 = unlimited)
 
 refresh:
   interval_sec: 60  # re-scan /proc/net/tcp every 60 seconds

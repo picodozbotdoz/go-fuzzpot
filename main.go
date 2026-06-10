@@ -67,8 +67,8 @@ func main() {
                 AddSource: false,
         }))
 
-        // Setup file logger (50MB per file, keep 10 rotated files = max ~500MB on disk)
-        log, err := logger.New(cfg.Logging.Dir, cfg.Logging.File, 50, 10)
+        // Setup file logger (configurable: rotate_mb, keep_files)
+        log, err := logger.New(cfg.Logging.Dir, cfg.Logging.File, cfg.Logging.RotateMB, cfg.Logging.KeepFiles)
         if err != nil {
                 fmt.Fprintf(os.Stderr, "logger init: %v\n", err)
                 os.Exit(1)
@@ -101,18 +101,18 @@ func main() {
         pm := portscan.NewPortManager(cfg.Ports.Exclude)
 
         // Show banner
-        fmt.Println()
-        fmt.Printf("  ██▀███   ██▀███   ▒█████   ███▄    █  ▒█████  \n")
-        fmt.Printf(" ▓██ ▒ ██▒▓██ ▒ ██▒▒██▒  ██▒ ██ ▀█   █ ▒██▒  ██▒\n")
-        fmt.Printf(" ▓██ ░▄█ ▒▓██ ░▄█ ▒▒██░  ██▒▓██  ▀█ ██▒▒██░  ██▒\n")
-        fmt.Printf(" ▒██▀▀█▄  ▒██▀▀█▄  ▒██   ██ ░▓██▒  ▐▌██▒▒██   ██░\n")
-        fmt.Printf(" ░██▓ ▒██▒░██▓ ▒██▒░ ████▓▒░░▒██░   ▓██░░ ████▓▒░\n")
-        fmt.Printf(" ░ ▒▓ ░▒▓░░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░   ▒ ▒ ░ ▒░▒░▒░ \n")
-        fmt.Printf("   ░▒ ░ ▒░  ░▒ ░ ▒░  ░ ▒ ▒░   ░ ░░ ░ ░ ▒   ░ ▒ ▒░ \n")
-        fmt.Printf("   ░░   ░   ░░   ░ ░ ░ ░ ▒     ░░   ░  ░   ░ ░ ▒  \n")
-        fmt.Printf("    ░        ░           ░ ░      ░          ░  ░  \n")
-        fmt.Printf("                  Protocol Fuzzing Honeypot          \n")
-        fmt.Printf("                         v%s                      \n\n", version)
+        fmt.Fprintln(os.Stderr,)
+        fmt.Fprintf(os.Stderr,"  ██▀███   ██▀███   ▒█████   ███▄    █  ▒█████  \n")
+        fmt.Fprintf(os.Stderr," ▓██ ▒ ██▒▓██ ▒ ██▒▒██▒  ██▒ ██ ▀█   █ ▒██▒  ██▒\n")
+        fmt.Fprintf(os.Stderr," ▓██ ░▄█ ▒▓██ ░▄█ ▒▒██░  ██▒▓██  ▀█ ██▒▒██░  ██▒\n")
+        fmt.Fprintf(os.Stderr," ▒██▀▀█▄  ▒██▀▀█▄  ▒██   ██ ░▓██▒  ▐▌██▒▒██   ██░\n")
+        fmt.Fprintf(os.Stderr," ░██▓ ▒██▒░██▓ ▒██▒░ ████▓▒░░▒██░   ▓██░░ ████▓▒░\n")
+        fmt.Fprintf(os.Stderr," ░ ▒▓ ░▒▓░░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░   ▒ ▒ ░ ▒░▒░▒░ \n")
+        fmt.Fprintf(os.Stderr,"   ░▒ ░ ▒░  ░▒ ░ ▒░  ░ ▒ ▒░   ░ ░░ ░ ░ ▒   ░ ▒ ▒░ \n")
+        fmt.Fprintf(os.Stderr,"   ░░   ░   ░░   ░ ░ ░ ░ ▒     ░░   ░  ░   ░ ░ ▒  \n")
+        fmt.Fprintf(os.Stderr,"    ░        ░           ░ ░      ░          ░  ░  \n")
+        fmt.Fprintf(os.Stderr,"                  Protocol Fuzzing Honeypot          \n")
+        fmt.Fprintf(os.Stderr,"                         v%s                      \n\n", version)
 
         // Show conflict analysis
         showConflictAnalysis(pm, ranges, cfg)
@@ -121,22 +121,22 @@ func main() {
         targets := pm.TargetPorts(ranges)
         sort.Ints(targets)
 
-        fmt.Printf("  [*] Ports in scope:   %d ports\n", len(targets))
+        fmt.Fprintf(os.Stderr,"  [*] Ports in scope:   %d ports\n", len(targets))
         if len(targets) > 0 {
-                fmt.Printf("  [*] Range:            %d – %d\n", targets[0], targets[len(targets)-1])
+                fmt.Fprintf(os.Stderr,"  [*] Range:            %d – %d\n", targets[0], targets[len(targets)-1])
         }
-        fmt.Printf("  [*] Log file:         %s\n", cfg.LogPath())
-        fmt.Printf("  [*] Read timeout:     %ds\n", cfg.Capture.ReadTimeoutSec)
-        fmt.Printf("  [*] Refresh interval: %ds\n", cfg.Refresh.IntervalSec)
+        fmt.Fprintf(os.Stderr,"  [*] Log file:         %s\n", cfg.LogPath())
+        fmt.Fprintf(os.Stderr,"  [*] Read timeout:     %ds\n", cfg.Capture.ReadTimeoutSec)
+        fmt.Fprintf(os.Stderr,"  [*] Refresh interval: %ds\n", cfg.Refresh.IntervalSec)
 
         if *dryRun {
-                fmt.Println()
+                fmt.Fprintln(os.Stderr,)
                 showPortSummary(targets)
                 os.Exit(0)
         }
 
-        fmt.Println()
-        fmt.Println("  [*] Starting listeners...")
+        fmt.Fprintln(os.Stderr,)
+        fmt.Fprintln(os.Stderr,"  [*] Starting listeners...")
 
         // Context for graceful shutdown
         ctx, cancel := context.WithCancel(context.Background())
@@ -147,7 +147,7 @@ func main() {
         signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
         go func() {
                 <-sigCh
-                fmt.Println("\n  [*] Shutting down...")
+                fmt.Fprintln(os.Stderr,"\n  [*] Shutting down...")
                 cancel()
         }()
 
@@ -186,7 +186,7 @@ func main() {
                         throt := stats.throttled
                         listening := pm.ListeningCount()
                         stats.mu.Unlock()
-                        fmt.Printf("  [stats] listening:%d  connections:%d  payloads:%d  errors:%d  throttled:%d\n",
+                        fmt.Fprintf(os.Stderr,"  [stats] listening:%d  connections:%d  payloads:%d  errors:%d  throttled:%d\n",
                                 listening, conn, pay, errs, throt)
                         slogLogger.Info("stats_tick",
                                 "listening_ports", listening,
@@ -215,7 +215,7 @@ func main() {
                 time.Sleep(time.Millisecond) // stagger goroutine starts
         }
 
-        fmt.Printf("  [*] Ready. Listening on %d ports.\n\n", len(targets))
+        fmt.Fprintf(os.Stderr,"  [*] Ready. Listening on %d ports.\n\n", len(targets))
 
         // Periodic conflict re-check
         ticker := time.NewTicker(cfg.RefreshInterval())
@@ -226,7 +226,7 @@ func main() {
                 case <-ctx.Done():
                         statsWriter.Stop()
                         stats.mu.Lock()
-                        fmt.Printf("  [*] Final: connections=%d payloads=%d errors=%d throttled=%d\n",
+                        fmt.Fprintf(os.Stderr,"  [*] Final: connections=%d payloads=%d errors=%d throttled=%d\n",
                                 stats.connections, stats.payloads, stats.errors, stats.throttled)
                         slogLogger.Info("fuzzpot_shutdown",
                                 "connections_total", stats.connections,
@@ -235,13 +235,13 @@ func main() {
                                 "connections_throttled", stats.throttled,
                         )
                         stats.mu.Unlock()
-                        fmt.Println("  [*] Done.")
+                        fmt.Fprintln(os.Stderr,"  [*] Done.")
                         return
                 case <-ticker.C:
                         conflicts := pm.DetectConflicts()
                         if len(conflicts) > 0 {
                                 secLog.LogConflict(conflicts)
-                                fmt.Printf("  [!] %d port conflicts detected (claimed by system): %v\n",
+                                fmt.Fprintf(os.Stderr,"  [!] %d port conflicts detected (claimed by system): %v\n",
                                         len(conflicts), conflicts)
                                 slogLogger.Warn("port_conflicts_detected",
                                         "conflict_count", len(conflicts),
@@ -377,7 +377,7 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
                 }
 
                 // Console output
-                fmt.Printf("  [hit] %s:%d → :%d  %d bytes  %q\n",
+                fmt.Fprintf(os.Stderr,"  [hit] %s:%d → :%d  %d bytes  %q\n",
                         event.SourceIP, event.SourcePort, port,
                         event.Size, truncate(event.Printable, 80))
         }
@@ -404,33 +404,33 @@ func showConflictAnalysis(pm *portscan.PortManager, ranges [][2]int, cfg *config
                 }
         }
 
-        fmt.Println("  ── Port Conflict Analysis ──────────────────────────────")
-        fmt.Printf("  [!] System-in-use:    %d ports  %s\n", len(excludedBySystem), truncatePortList(excludedBySystem, 8))
-        fmt.Printf("  [!] Config-excluded:  %d ports  %s\n", len(excludedByConfig), truncatePortList(excludedByConfig, 8))
-        fmt.Printf("  [!] Ephemeral range:  %d ports  (%d-%d)\n", len(excludedByEphemeral), ephLo, ephHi)
-        fmt.Printf("  [✓] Available:        %d ports\n", len(available))
-        fmt.Println("  ─────────────────────────────────────────────────────────")
+        fmt.Fprintln(os.Stderr,"  ── Port Conflict Analysis ──────────────────────────────")
+        fmt.Fprintf(os.Stderr,"  [!] System-in-use:    %d ports  %s\n", len(excludedBySystem), truncatePortList(excludedBySystem, 8))
+        fmt.Fprintf(os.Stderr,"  [!] Config-excluded:  %d ports  %s\n", len(excludedByConfig), truncatePortList(excludedByConfig, 8))
+        fmt.Fprintf(os.Stderr,"  [!] Ephemeral range:  %d ports  (%d-%d)\n", len(excludedByEphemeral), ephLo, ephHi)
+        fmt.Fprintf(os.Stderr,"  [✓] Available:        %d ports\n", len(available))
+        fmt.Fprintln(os.Stderr,"  ─────────────────────────────────────────────────────────")
 }
 
 func showPortSummary(ports []int) {
-        fmt.Println("  ── Target Ports ─────────────────────────────────────────")
+        fmt.Fprintln(os.Stderr,"  ── Target Ports ─────────────────────────────────────────")
 
         // Group into ranges for readable output
         if len(ports) == 0 {
-                fmt.Println("  (none)")
+                fmt.Fprintln(os.Stderr,"  (none)")
                 return
         }
 
         // Show first/last 10
         show := ports
         if len(show) > 20 {
-                fmt.Printf("  First 10: %s\n", formatPortList(show[:10]))
-                fmt.Printf("  ...       (%d more)\n", len(show)-20)
-                fmt.Printf("  Last 10:  %s\n", formatPortList(show[len(show)-10:]))
+                fmt.Fprintf(os.Stderr,"  First 10: %s\n", formatPortList(show[:10]))
+                fmt.Fprintf(os.Stderr,"  ...       (%d more)\n", len(show)-20)
+                fmt.Fprintf(os.Stderr,"  Last 10:  %s\n", formatPortList(show[len(show)-10:]))
         } else {
-                fmt.Printf("  %s\n", formatPortList(show))
+                fmt.Fprintf(os.Stderr,"  %s\n", formatPortList(show))
         }
-        fmt.Println("  ─────────────────────────────────────────────────────────")
+        fmt.Fprintln(os.Stderr,"  ─────────────────────────────────────────────────────────")
 }
 
 func contains(slice []int, val int) bool {

@@ -24,6 +24,12 @@ func TestDefaultConfig(t *testing.T) {
         if cfg.Refresh.IntervalSec != 60 {
                 t.Errorf("Default RefreshInterval = %d, want 60", cfg.Refresh.IntervalSec)
         }
+        if cfg.Logging.RotateMB != 50 {
+                t.Errorf("Default RotateMB = %d, want 50", cfg.Logging.RotateMB)
+        }
+        if cfg.Logging.KeepFiles != 10 {
+                t.Errorf("Default KeepFiles = %d, want 10", cfg.Logging.KeepFiles)
+        }
 }
 
 func TestValidate_Valid(t *testing.T) {
@@ -91,6 +97,30 @@ func TestValidate_RefreshIntervalBoundary(t *testing.T) {
         cfg.Refresh.IntervalSec = 5 // minimum allowed
         if err := cfg.Validate(); err != nil {
                 t.Errorf("expected no error for IntervalSec=5, got: %v", err)
+        }
+}
+
+func TestValidate_RotateMB_Invalid(t *testing.T) {
+        cfg := DefaultConfig()
+        cfg.Logging.RotateMB = 0
+        if err := cfg.Validate(); err == nil {
+                t.Error("expected error for RotateMB=0")
+        }
+}
+
+func TestValidate_KeepFiles_Invalid(t *testing.T) {
+        cfg := DefaultConfig()
+        cfg.Logging.KeepFiles = -1
+        if err := cfg.Validate(); err == nil {
+                t.Error("expected error for KeepFiles=-1")
+        }
+}
+
+func TestValidate_KeepFiles_Zero(t *testing.T) {
+        cfg := DefaultConfig()
+        cfg.Logging.KeepFiles = 0 // 0 = unlimited, should be valid
+        if err := cfg.Validate(); err != nil {
+                t.Errorf("expected no error for KeepFiles=0, got: %v", err)
         }
 }
 

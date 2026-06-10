@@ -32,8 +32,10 @@ type CaptureConfig struct {
 }
 
 type LoggingConfig struct {
-        Dir  string `yaml:"dir"`
-        File string `yaml:"file"`
+        Dir      string `yaml:"dir"`
+        File     string `yaml:"file"`
+        RotateMB int    `yaml:"rotate_mb"`
+        KeepFiles int   `yaml:"keep_files"`
 }
 
 type RefreshConfig struct {
@@ -55,8 +57,10 @@ func DefaultConfig() Config {
                         LogHexPayload:  true,
                 },
                 Logging: LoggingConfig{
-                        Dir:  "/var/log/fuzzpot",
-                        File: "payloads.log",
+                        Dir:       "/var/log/fuzzpot",
+                        File:      "payloads.log",
+                        RotateMB:  50,
+                        KeepFiles: 10,
                 },
                 Refresh: RefreshConfig{
                         IntervalSec: 60,
@@ -96,6 +100,12 @@ func (c *Config) Validate() error {
         }
         if c.Refresh.IntervalSec < 5 {
                 return fmt.Errorf("refresh_interval_sec must be >= 5")
+        }
+        if c.Logging.RotateMB < 1 {
+                return fmt.Errorf("rotate_mb must be >= 1")
+        }
+        if c.Logging.KeepFiles < 0 {
+                return fmt.Errorf("keep_files must be >= 0")
         }
         return nil
 }
