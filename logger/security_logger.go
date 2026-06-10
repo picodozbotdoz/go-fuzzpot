@@ -13,7 +13,6 @@ const (
 )
 
 // SecurityEvent is a typed struct for security log serialization.
-// Using json.Marshal on a struct ensures proper escaping and consistent field names.
 type SecurityEvent struct {
 	EventType  SecurityEventType `json:"event_type"`
 	Timestamp  string            `json:"ts"`

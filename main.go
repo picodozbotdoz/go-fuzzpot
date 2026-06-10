@@ -15,6 +15,7 @@ import (
         "sync/atomic"
         "syscall"
         "time"
+        "unicode/utf8"
 
         "golang.org/x/sys/unix"
 
@@ -22,6 +23,11 @@ import (
         "fuzzpot/config"
         "fuzzpot/logger"
         "fuzzpot/portscan"
+)
+
+var (
+        version    = "1.1.0"
+        slogLogger *slog.Logger // structured logger for operational events
 )
 
 // LogEntry is a typed struct for JSON log serialization.
@@ -38,11 +44,6 @@ type LogEntry struct {
         Hex           string `json:"hex"`
         PayloadSHA256 string `json:"payload_sha256,omitempty"` // SHA256 hash for threat intel
 }
-
-var (
-        version    = "1.1.0"
-        slogLogger *slog.Logger // structured logger for operational events
-)
 
 func main() {
         cfgPath := flag.String("config", "config/config.yaml", "path to config file")
@@ -317,12 +318,11 @@ func listenPort(
                 // If at capacity, close immediately to prevent goroutine explosion.
                 select {
                 case connSem <- struct{}{}:
-                        // Successfully acquired semaphore slot
                         go handleConnection(conn, port, cfg, log, stats, connSem)
                 default:
                         // At capacity — close immediately, log throttle event
                         secLog.LogThrottled(conn.RemoteAddr().String(), port)
-                                atomic.AddInt64(&stats.throttled, 1)
+                        atomic.AddInt64(&stats.throttled, 1)
                         conn.Close()
                 }
         }
@@ -346,7 +346,7 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
                 stats.payloads++
                 stats.mu.Unlock()
 
-                // Proper JSON serialization - no manual escaping needed
+                // Write to log using typed struct for proper JSON escaping
                 logEntry := LogEntry{
                         Timestamp:     event.Timestamp.UTC().Format(time.RFC3339),
                         SourceIP:      event.SourceIP,
@@ -371,7 +371,7 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
                         stats.mu.Unlock()
                 }
 
-                // Console output (still truncate for readability)
+                // Console output
                 fmt.Printf("  [hit] %s:%d → :%d  %d bytes  %q\n",
                         event.SourceIP, event.SourcePort, port,
                         event.Size, truncate(event.Printable, 80))
@@ -437,14 +437,12 @@ func contains(slice []int, val int) bool {
         return false
 }
 
-
-// sanitizeForLog removed: json.Marshal on typed structs handles all
-// escaping correctly, making manual sanitization unnecessary and error-prone.
-func truncate(s string, max int) string {
-        if len(s) <= max {
+func truncate(s string, maxRunes int) string {
+        if utf8.RuneCountInString(s) <= maxRunes {
                 return s
         }
-        return s[:max] + "..."
+        runes := []rune(s)
+        return string(runes[:maxRunes]) + "..."
 }
 
 func formatPortList(ports []int) string {
