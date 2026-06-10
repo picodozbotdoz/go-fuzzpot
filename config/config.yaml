@@ -17,6 +17,7 @@ ports:
 capture:
   read_timeout_sec: 10      # seconds to wait for payload data
   max_payload_size: 65536   # max bytes to capture per connection (64KB)
+  # log_hex_payload: true   # set false to omit hex dump (saves ~2x log space)
 
 logging:
   dir: /var/log/fuzzpot

@@ -3,7 +3,9 @@ package capture
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"net"
 	"testing"
+	"time"
 )
 
 func TestExtractPrintable(t *testing.T) {
@@ -103,3 +105,181 @@ func TestPayloadSHA256_DifferentInputs(t *testing.T) {
 		t.Error("different payloads should produce different SHA256 hashes")
 	}
 }
+
+// pipePair returns a connected pair of net.Conn for testing Capture().
+// The returned pair behaves like net.TCPConn but does NOT implement *net.TCPAddr,
+// which exercises the non-TCP safety branch of Capture().
+func pipePair() (net.Conn, net.Conn) {
+	return net.Pipe()
+}
+
+func TestCapture_Basic(t *testing.T) {
+	// Use a real TCP connection to exercise the *net.TCPAddr code path
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	addr := listener.Addr().String()
+	payload := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		if _, err := conn.Write(payload); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	event := Capture(server, time.Second, 65536)
+
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+
+	if event.Size != len(payload) {
+		t.Errorf("Size = %d, want %d", event.Size, len(payload))
+	}
+	if event.Hex != hex.EncodeToString(payload) {
+		t.Errorf("Hex mismatch:\ngot:  %q\nwant: %q", event.Hex, hex.EncodeToString(payload))
+	}
+	if event.Proto != "tcp" {
+		t.Errorf("Proto = %q, want \"tcp\"", event.Proto)
+	}
+	if event.PayloadSHA256 == "" {
+		t.Fatal("PayloadSHA256 should not be empty for non-empty payload")
+	}
+	if len(event.PayloadSHA256) != 64 {
+		t.Errorf("PayloadSHA256 length = %d, want 64", len(event.PayloadSHA256))
+	}
+	// Verify SHA256 correctness
+	shaSum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(shaSum[:])
+	if event.PayloadSHA256 != expectedHash {
+		t.Errorf("PayloadSHA256 = %q, want %q", event.PayloadSHA256, expectedHash)
+	}
+	if event.SourceIP != "127.0.0.1" {
+		t.Errorf("SourceIP = %q, want \"127.0.0.1\"", event.SourceIP)
+	}
+}
+
+func TestCapture_EmptyPayload(t *testing.T) {
+	server, client := pipePair()
+	defer server.Close()
+	defer client.Close()
+
+	go func() {
+		client.Close()
+	}()
+
+	event := Capture(server, time.Second, 65536)
+
+	if event.Size != 0 {
+		t.Errorf("Size = %d, want 0", event.Size)
+	}
+	if event.PayloadSHA256 != "" {
+		t.Errorf("PayloadSHA256 for empty payload should be empty, got %q", event.PayloadSHA256)
+	}
+}
+
+func TestCapture_MaxPayloadSizeLimit(t *testing.T) {
+	// Use real TCP so data arrives in chunks
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	addr := listener.Addr().String()
+	payload := make([]byte, 200)
+	for i := range payload {
+		payload[i] = 'A'
+	}
+
+	go func() {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Write in chunks to force multiple Read() calls
+		conn.Write(payload[:100])
+		// Small delay to let the server read first chunk before sending second
+		time.Sleep(50 * time.Millisecond)
+		conn.Write(payload[100:])
+	}()
+
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	event := Capture(server, time.Second, 50)
+
+	if event.Size > 200 {
+		t.Errorf("Size = %d, should not exceed payload size", event.Size)
+	}
+}
+
+func TestCapture_ReadTimeout(t *testing.T) {
+	server, client := pipePair()
+	defer server.Close()
+	defer client.Close()
+
+	payload := []byte("hello")
+	go func() {
+		client.Write(payload)
+		// Don't close — let timeout trigger
+		time.Sleep(100 * time.Millisecond)
+		client.Write([]byte(" world"))
+		client.Close()
+	}()
+
+	event := Capture(server, 50*time.Millisecond, 65536)
+
+	// With a short timeout, we should get the first write but not the second
+	if event.Size == 0 {
+		t.Error("expected at least some data before timeout")
+	}
+}
+
+func TestCapture_NonTCPNoPanic(t *testing.T) {
+	// net.Pipe returns connections whose RemoteAddr() is NOT *net.TCPAddr.
+	// Capture should handle this gracefully without panicking (regression test).
+	server, client := pipePair()
+	defer server.Close()
+	defer client.Close()
+
+	payload := []byte("test data")
+	go func() {
+		client.Write(payload)
+		client.Close()
+	}()
+
+	event := Capture(server, time.Second, 65536)
+
+	// The non-TCP branch should still capture the data
+	if event.Size != len(payload) {
+		t.Errorf("Size = %d, want %d", event.Size, len(payload))
+	}
+	// SourceIP should be empty since RemoteAddr isn't *net.TCPAddr
+	if event.SourceIP != "" {
+		t.Errorf("expected empty SourceIP for non-TCP conn, got %q", event.SourceIP)
+	}
+}
+

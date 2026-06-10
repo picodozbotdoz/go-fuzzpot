@@ -26,8 +26,9 @@ type PortRange struct {
 }
 
 type CaptureConfig struct {
-        ReadTimeoutSec int `yaml:"read_timeout_sec"`
-        MaxPayloadSize int `yaml:"max_payload_size"`
+        ReadTimeoutSec int  `yaml:"read_timeout_sec"`
+        MaxPayloadSize int  `yaml:"max_payload_size"`
+        LogHexPayload  bool `yaml:"log_hex_payload"`
 }
 
 type LoggingConfig struct {
@@ -51,6 +52,7 @@ func DefaultConfig() Config {
                 Capture: CaptureConfig{
                         ReadTimeoutSec: 10,
                         MaxPayloadSize: 65536,
+                        LogHexPayload:  true,
                 },
                 Logging: LoggingConfig{
                         Dir:  "/var/log/fuzzpot",

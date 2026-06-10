@@ -41,7 +41,7 @@ type LogEntry struct {
         Proto         string `json:"proto"`
         Size          int    `json:"size"`
         Printable     string `json:"printable"`          // json.Marshal handles escaping
-        Hex           string `json:"hex"`
+        Hex           string `json:"hex,omitempty"`
         PayloadSHA256 string `json:"payload_sha256,omitempty"` // SHA256 hash for threat intel
 }
 
@@ -355,8 +355,13 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
                         Proto:         event.Proto,
                         Size:          event.Size,
                         Printable:     event.Printable, // json.Marshal will escape correctly
-                        Hex:           event.Hex,
                         PayloadSHA256: event.PayloadSHA256,
+                }
+
+                // Hex payload is large (~2x raw size); omit it when configured
+                // to reduce log volume. SHA256 is sufficient for deduplication.
+                if cfg.Capture.LogHexPayload {
+                        logEntry.Hex = event.Hex
                 }
 
                 if err := log.WriteEventTyped(logEntry); err != nil {
