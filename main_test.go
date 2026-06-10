@@ -464,3 +464,61 @@ func TestEndToEnd_LogHexPayloadDisabled(t *testing.T) {
 	ln.Close()
 }
 
+// panicConn wraps a net.Conn and panics on Read to test recovery.
+type panicConn struct {
+	net.Conn
+}
+
+func (p *panicConn) Read([]byte) (int, error) {
+	panic("simulated panic in capture")
+}
+
+func (p *panicConn) Close() error { return nil }
+
+func TestHandleConnection_PanicRecovery(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+
+	var stats struct {
+		mu          sync.Mutex
+		connections int64
+		payloads    int64
+		errors      int64
+		throttled   int64
+	}
+
+	// Create a base connection just for type assertions
+	server, _ := net.Pipe()
+	defer server.Close()
+
+	conn := &panicConn{Conn: server}
+	cfg := &config.Config{
+		Capture: config.CaptureConfig{
+			ReadTimeoutSec: 1,
+			MaxPayloadSize: 1024,
+		},
+	}
+
+	// Use a buffered channel to detect completion
+	done := make(chan struct{}, 1)
+	connSem := make(chan struct{}, 1)
+	connSem <- struct{}{} // pre-fill so the defer release works
+
+	go func() {
+		handleConnection(conn, 9999, cfg, nil, &stats, connSem)
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+		// Good — didn't panic
+	case <-time.After(time.Second):
+		t.Fatal("handleConnection hung after panic recovery")
+	}
+
+	stats.mu.Lock()
+	if stats.errors != 1 {
+		t.Errorf("errors = %d, want 1 (panic should be counted)", stats.errors)
+	}
+	stats.mu.Unlock()
+}
+

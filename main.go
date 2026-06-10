@@ -142,15 +142,6 @@ func main() {
         ctx, cancel := context.WithCancel(context.Background())
         defer cancel()
 
-        // Graceful shutdown on SIGINT/SIGTERM
-        sigCh := make(chan os.Signal, 1)
-        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-        go func() {
-                <-sigCh
-                fmt.Fprintln(os.Stderr,"\n  [*] Shutting down...")
-                cancel()
-        }()
-
         // Connection limiter — prevent goroutine explosion under flood.
         // Dynamically set maxConcurrent based on system file descriptor limit
         // to prevent DoS from exhausting all available FDs.
@@ -195,6 +186,25 @@ func main() {
                                 "errors_total", errs,
                                 "connections_throttled", throt,
                         )
+                }
+        }()
+
+        // Graceful shutdown on SIGINT/SIGTERM, health-check on SIGUSR1
+        sigCh := make(chan os.Signal, 1)
+        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
+        go func() {
+                for sig := range sigCh {
+                        switch sig {
+                        case syscall.SIGINT, syscall.SIGTERM:
+                                fmt.Fprintln(os.Stderr,"\n  [*] Shutting down...")
+                                cancel()
+                                return
+                        case syscall.SIGUSR1:
+                                stats.mu.Lock()
+                                fmt.Fprintf(os.Stderr,"  [health] listening=%d connections=%d payloads=%d errors=%d throttled=%d\n",
+                                        pm.ListeningCount(), stats.connections, stats.payloads, stats.errors, stats.throttled)
+                                stats.mu.Unlock()
+                        }
                 }
         }()
 
@@ -337,6 +347,18 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
 }, connSem chan struct{}) {
         defer conn.Close()
         defer func() { <-connSem }() // release semaphore slot
+        defer func() {
+                if r := recover(); r != nil {
+                        fmt.Fprintf(os.Stderr, "  [!] panic in handleConnection: %v\n", r)
+                        slogLogger.Error("handle_connection_panic",
+                                "port", port,
+                                "recover", r,
+                        )
+                        stats.mu.Lock()
+                        stats.errors++
+                        stats.mu.Unlock()
+                }
+        }()
 
         // Set deadline for the whole capture
         event := capture.Capture(conn, cfg.ReadTimeout(), cfg.Capture.MaxPayloadSize)
