@@ -36,10 +36,22 @@ var (
 	slogLogger *slog.Logger // structured logger for operational events
 )
 
+// logSchemaVersion is the JSONL contract version emitted in every
+// LogEntry's `v` field (B1-8). v1 = the original field set plus `v`
+// itself; consumers treat a missing `v` as pre-versioning v1.
+const logSchemaVersion = 1
+
 // LogEntry is a typed struct for JSON log serialization.
 // Using json.Marshal on a struct ensures proper escaping of all special
 // characters, preventing JSON log injection vulnerabilities.
+//
+// Schema version (B1-8): `v` identifies the JSONL contract version. v1
+// adds the field itself on top of the original schema; consumers must
+// treat a missing `v` as the pre-versioning format (field-compatible
+// with v1). The contract is validated in both fuzzpot and fuzz-sec-intel
+// (contract/contract_test.go ↔ tests/test_contract.py).
 type LogEntry struct {
+	V             int    `json:"v"`
 	Timestamp     string `json:"ts"`
 	SourceIP      string `json:"src_ip"`
 	SourcePort    int    `json:"src_port"`
@@ -447,6 +459,7 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
 
 		// Write to log using typed struct for proper JSON escaping
 		logEntry := LogEntry{
+			V:             logSchemaVersion,
 			Timestamp:     event.Timestamp.UTC().Format(time.RFC3339),
 			SourceIP:      event.SourceIP,
 			SourcePort:    event.SourcePort,

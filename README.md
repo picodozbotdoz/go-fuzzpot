@@ -23,6 +23,7 @@ Every connection is logged as a JSON line with:
 
 | Field | Description |
 |---|---|
+| `v` | Schema version (`1`; lines from pre-versioning builds lack it and are v1-compatible) |
 | `ts` | Timestamp (ISO 8601) |
 | `src_ip` | Attacker IP |
 | `src_port` | Attacker source port |
@@ -31,6 +32,8 @@ Every connection is logged as a JSON line with:
 | `size` | Payload size in bytes |
 | `printable` | Printable ASCII representation |
 | `hex` | Full hex dump of the payload |
+
+The machine-readable schema lives in [`contract/log_schema.json`](contract/log_schema.json) and is validated by contract tests in both fuzzpot and [fuzz-sec-intel](https://github.com/picodozbotdoz/fuzz-sec-intel) — changes must land as coordinated commits in both repos.
 
 ## Why?
 

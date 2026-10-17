@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/donniexyz/go-fuzzpot/contract/log_schema.json",
+  "title": "fuzzpot JSONL log line",
+  "description": "Contract shared by go-fuzzpot (producer) and fuzz-sec-intel (consumer). This file is byte-identical in both repositories; contract tests in both repos validate against it. Changing it requires coordinated commits in both repos.",
+  "type": "object",
+  "required": ["v", "ts", "src_ip", "src_port", "dst_port", "proto", "size", "printable"],
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "description": "Schema version. Lines written before versioning exist lack this field and are treated by consumers as v1-compatible.",
+      "type": "integer",
+      "const": 1
+    },
+    "ts": {
+      "description": "Event timestamp, RFC 3339 / ISO 8601 with timezone offset.",
+      "type": "string",
+      "minLength": 20
+    },
+    "src_ip": {
+      "description": "Remote (attacker) IP address.",
+      "type": "string",
+      "minLength": 1
+    },
+    "src_port": {
+      "description": "Remote TCP/UDP source port.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "dst_port": {
+      "description": "Honeypot port that was hit.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "proto": {
+      "description": "Transport protocol.",
+      "type": "string",
+      "enum": ["tcp", "udp"]
+    },
+    "size": {
+      "description": "Payload size in bytes.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "printable": {
+      "description": "Printable-ASCII rendering of the payload (may be empty).",
+      "type": "string"
+    },
+    "hex": {
+      "description": "Lowercase hex dump of the full payload; omitted when log_hex_payload is disabled.",
+      "type": "string"
+    },
+    "payload_sha256": {
+      "description": "SHA-256 of the raw payload (64 lowercase hex chars); omitted only in very old producers.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}
