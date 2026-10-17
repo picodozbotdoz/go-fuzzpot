@@ -58,7 +58,19 @@ func (s *statsCounters) snapshot() (connections, payloads, errs, throttled int64
 func main() {
 	cfgPath := flag.String("config", "config/config.yaml", "path to config file")
 	dryRun := flag.Bool("dry-run", false, "show target ports and exit without listening")
+	strict := flag.Bool("strict", false, "fail instead of falling back to built-in defaults when the config file is missing")
 	flag.Parse()
+
+	// A missing config silently binding ~4000 default ports is a trap:
+	// warn loudly, and let --strict make it fatal.
+	if !config.Exists(*cfgPath) {
+		if *strict {
+			fmt.Fprintf(os.Stderr, "config error: %s not found (strict mode: refusing to fall back to defaults)\n", *cfgPath)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "  [!] WARNING: config file %s not found — falling back to built-in defaults\n", *cfgPath)
+		fmt.Fprintf(os.Stderr, "  [!] WARNING: defaults bind ~4000 ports (ranges 2000-5000 and 8000-9000); use --strict to make a missing config fatal\n")
+	}
 
 	// Load config
 	cfg, err := config.Load(*cfgPath)

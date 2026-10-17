@@ -87,10 +87,27 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// Exists reports whether a config file is present at path. Callers use it
+// to warn (or, in strict mode, fail) before Load falls back to defaults.
+func Exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func (c *Config) Validate() error {
 	for _, r := range c.Ports.Ranges {
 		if r.From < 1 || r.To > 65535 || r.From > r.To {
 			return fmt.Errorf("invalid port range: %d-%d", r.From, r.To)
+		}
+	}
+	// Overlapping (or duplicated) ranges are almost always a config
+	// mistake; TargetPorts would silently dedup them.
+	for i := 0; i < len(c.Ports.Ranges); i++ {
+		for j := i + 1; j < len(c.Ports.Ranges); j++ {
+			a, b := c.Ports.Ranges[i], c.Ports.Ranges[j]
+			if a.From <= b.To && b.From <= a.To {
+				return fmt.Errorf("port ranges overlap: %d-%d and %d-%d", a.From, a.To, b.From, b.To)
+			}
 		}
 	}
 	if c.Capture.ReadTimeoutSec < 1 {

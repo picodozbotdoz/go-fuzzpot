@@ -40,8 +40,10 @@ func New(dir, filename string, rotSizeMB int, maxFiles ...int) (*Logger, error) 
 
 	info, _ := f.Stat()
 
-	mf := 10 // default: keep 10 rotated files (~500MB at 50MB each)
-	if len(maxFiles) > 0 && maxFiles[0] > 0 {
+	mf := 10 // default when unspecified (~500MB at 50MB per file)
+	if len(maxFiles) > 0 {
+		// Explicit value, including 0 = unlimited (pruning disabled),
+		// as documented for keep_files.
 		mf = maxFiles[0]
 	}
 
@@ -139,9 +141,7 @@ func (l *Logger) rotate() error {
 	l.written = 0
 
 	// Prune old rotated files if we have a cap
-	if l.maxFiles > 0 {
-		l.pruneOldLogs()
-	}
+	l.pruneOldLogs()
 	return nil
 }
 
@@ -170,7 +170,11 @@ func copyThenTruncate(src, dst string) error {
 
 // pruneOldLogs removes the oldest rotated log files when maxFiles is exceeded.
 // Only matches files with the expected timestamp suffix format (YYYYMMDD-HHMMSS).
+// A maxFiles of 0 or less means unlimited retention — never prune.
 func (l *Logger) pruneOldLogs() {
+	if l.maxFiles <= 0 {
+		return
+	}
 	pattern := l.logPath + ".*"
 	matches, err := filepath.Glob(pattern)
 	if err != nil {

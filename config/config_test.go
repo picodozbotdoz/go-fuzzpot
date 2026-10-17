@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -121,6 +122,45 @@ func TestValidate_KeepFiles_Zero(t *testing.T) {
 	cfg.Logging.KeepFiles = 0 // 0 = unlimited, should be valid
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("expected no error for KeepFiles=0, got: %v", err)
+	}
+}
+
+func TestValidate_OverlappingRanges(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Ports.Ranges = []PortRange{{From: 1000, To: 2000}, {From: 1500, To: 2500}}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "overlap") {
+		t.Errorf("expected overlap error, got: %v", err)
+	}
+}
+
+func TestValidate_DuplicateRanges(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Ports.Ranges = []PortRange{{From: 1000, To: 2000}, {From: 1000, To: 2000}}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "overlap") {
+		t.Errorf("expected overlap error for duplicate ranges, got: %v", err)
+	}
+}
+
+func TestValidate_AdjacentRangesValid(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Ports.Ranges = []PortRange{{From: 1000, To: 2000}, {From: 2001, To: 3000}}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("adjacent ranges should be valid, got: %v", err)
+	}
+}
+
+func TestExists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	if Exists(path) {
+		t.Error("Exists() should be false for a missing file")
+	}
+	if err := os.WriteFile(path, []byte("ports: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !Exists(path) {
+		t.Error("Exists() should be true after the file is created")
 	}
 }
 

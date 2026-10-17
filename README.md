@@ -72,6 +72,10 @@ go build -o fuzzpot .
 
 # Custom config path
 ./fuzzpot --config /path/to/config.yaml
+
+# Refuse to start if the config file is missing
+# (otherwise fuzzpot falls back to built-in defaults with a loud warning)
+./fuzzpot --strict
 ```
 
 ### Install as systemd service

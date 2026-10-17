@@ -2,6 +2,7 @@ package logger
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -242,6 +243,49 @@ func TestPruneOldLogs_NoopWhenUnderLimit(t *testing.T) {
 	matches, _ := filepath.Glob(basePath + ".*")
 	if len(matches) != 2 {
 		t.Errorf("expected 2 rotated files (under limit), got %d", len(matches))
+	}
+}
+
+func TestKeepFilesZeroMeansUnlimited(t *testing.T) {
+	tmpDir := t.TempDir()
+	log, err := New(tmpDir, "unlimited.log", 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	if log.maxFiles != 0 {
+		t.Errorf("maxFiles = %d, want 0 (unlimited), explicit 0 must not be coerced to the default", log.maxFiles)
+	}
+
+	// With unlimited retention, pruning must never remove rotated files.
+	basePath := log.Path()
+	for i := 0; i < 15; i++ {
+		rotated := fmt.Sprintf("%s.20250101-%06d", basePath, i)
+		if err := os.WriteFile(rotated, []byte("old log data"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log.mu.Lock()
+	log.pruneOldLogs()
+	log.mu.Unlock()
+
+	matches, _ := filepath.Glob(basePath + ".*")
+	if len(matches) != 15 {
+		t.Errorf("expected all 15 rotated files kept (unlimited), got %d", len(matches))
+	}
+}
+
+func TestKeepFilesDefaultWhenUnspecified(t *testing.T) {
+	tmpDir := t.TempDir()
+	log, err := New(tmpDir, "default.log", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	if log.maxFiles != 10 {
+		t.Errorf("maxFiles = %d, want default 10 when unspecified", log.maxFiles)
 	}
 }
 
