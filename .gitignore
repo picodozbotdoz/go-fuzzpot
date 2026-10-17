@@ -40,3 +40,7 @@ htmlcov/
 
 # Code intelligence
 .codegraph/
+
+# Prebuilt release artifacts (build locally with go build / build-release.sh)
+/fuzzpot
+/release/
