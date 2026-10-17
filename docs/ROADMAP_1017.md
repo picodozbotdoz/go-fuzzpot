@@ -58,3 +58,5 @@ _(record capture/sec numbers per release here as A3-16 lands)_
 ## Changelog of roadmap changes
 
 - 2026-10-18: roadmap materialized from engagement brief (Step 0).
+
+- 2026-10-18 (B1-8 cross-repo, landed): `v:1` field in every LogEntry; contract/log_schema.json + sample fixture byte-identical in both repos; contract tests run under both gates.
