@@ -10,8 +10,8 @@ Companion file: `repo/fuzz-sec-intel/docs/ROADMAP_1017.md` (sections B0–B4 + C
 ### A0 — Correctness & hygiene (do first)
 
 - [x] **A0-1 Repair broken scripts** — `install.sh` invokes nonexistent `s2do` everywhere sudo belongs (17, 24-48, 59-62); `build-release.sh` invokes `g2t` where git belongs (62-65), hardcodes `cd /home/plain/.picoclaw/...` (4, 59, 269, 290), copies a systemd file from a path it never creates (195, 254, 277) and a missing `LICENSE` (279) — with `set -e` its later steps always fail. ✅ 2026-10-18: `s2do`→`SUDO` wrapper (root-aware), `g2t`→`git`, hardcoded paths→`$SCRIPT_DIR`, service path→`$BUILDDIR/deb/...`, added MIT `LICENSE`. `bash -n` passes both.
-- [ ] **A0-2 Remove committed build artifacts from git** — the 4.6 MB `fuzzpot` binary at repo root and ~43 MB of binaries/zips in `release/`; gitignore both patterns.
-- [ ] **A0-3 gofmt + stats race fix** — gofmt all 13 .go files (all currently fail); fix the factually wrong SO_BACKLOG/ListenBacklog comment (main.go:288); make all four stats counters uniformly atomic (`connections` is atomic-written at main.go:325 but mutex-read at 174/205/240 — race-detector-visible).
+- [x] **A0-2 Remove committed build artifacts from git** — the 4.6 MB `fuzzpot` binary at repo root and ~43 MB of binaries/zips in `release/`; gitignore both patterns. ✅ 2026-10-18: `git rm --cached` (files kept on disk) + `.gitignore` `/fuzzpot` and `/release/`. History untouched per hard rules.
+- [x] **A0-3 gofmt + stats race fix** — gofmt all 13 .go files (all currently fail); fix the factually wrong SO_BACKLOG/ListenBacklog comment (main.go:288); make all four stats counters uniformly atomic (`connections` is atomic-written at main.go:325 but mutex-read at 174/205/240 — race-detector-visible). ✅ 2026-10-18: `gofmt -w` all files; new named `statsCounters` (atomic.Int64 + snapshot()) replaces the triplicated anonymous mutex struct in main/tests; backlog comment corrected (listen(2) arg via ListenConfig.Backlog, no SO_BACKLOG option). Also fixed D-1 Windows build (see below) and filepath.Join path joins.
 - [ ] **A0-4 Config traps** — a missing config file silently applies defaults → binds ~4000 unintended ports (config.go:76-78): add a loud warning and a `--strict` flag that hard-fails; validate overlapping/duplicate ranges; fix `keep_files: 0` documented as "unlimited" but silently becoming 10 (logger.go:43-46).
 - [ ] **A0-5 Accept-loop backoff** — accept loop hot-spins on permanent errors (main.go:317-323): classify temporary vs permanent net errors, exponential backoff, listener restart.
 
@@ -43,13 +43,17 @@ Companion file: `repo/fuzz-sec-intel/docs/ROADMAP_1017.md` (sections B0–B4 + C
 - [ ] **C-3 Benchmarks tracked per release** — fuzzpot captures/sec (recorded here per release).
 - [ ] **C-4 Debt tax** — every feature item completed pays for one B0/B1-class debt fix before the next feature.
 
+## Newly discovered improvements (append-only)
+
+- [x] **D-1 Windows build broken by unix.Getrlimit** (found 2026-10-18 during A0-3): main.go queried RLIMIT_NOFILE unconditionally; `unix.Rlimit`/`Getrlimit`/`SetsockoptInt` and `syscall.SIGUSR1` are undefined on windows in x/sys → `go vet`/`go build` failed on Windows. ✅ Fixed same day: platform split `platform_unix.go`/`platform_windows.go` (`maxConnections()`, `healthSignals()`, `listenControl`); main.go no longer imports x/sys. Cross-compile verified linux/freebsd/darwin; `go test ./...` green on Windows. Sub-fixes: `filepath.Join` in logger.New and Config.LogPath (+2 tests updated from hardcoded `/`).
+
 ## Benchmarks
 
 _(record capture/sec numbers per release here as A3-16 lands)_
 
 ## Blockers
 
-_(one-liners; pick next unblocked item and continue — never idle)_
+- 2026-10-18: `go test -race` unavailable on this Windows dev box (needs cgo + gcc; neither present). Race gate must run in Linux CI (see A3-17). Cross-compile checks (linux/freebsd/darwin) used as a partial substitute.
 
 ## Changelog of roadmap changes
 

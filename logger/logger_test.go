@@ -253,8 +253,9 @@ func TestNewSecurityLogger(t *testing.T) {
 	}
 	defer secLog.Close()
 
-	if secLog.Path() != tmpDir+"/security.log" {
-		t.Errorf("security log path = %q, want %q", secLog.Path(), tmpDir+"/security.log")
+	wantPath := filepath.Join(tmpDir, "security.log")
+	if secLog.Path() != wantPath {
+		t.Errorf("security log path = %q, want %q", secLog.Path(), wantPath)
 	}
 }
 
@@ -320,4 +321,3 @@ func TestSecurityLogger_LogConflict(t *testing.T) {
 		t.Errorf("Ports = %v, want [80 443 8080]", event.Ports)
 	}
 }
-

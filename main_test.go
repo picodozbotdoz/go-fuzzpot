@@ -9,8 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,14 +146,8 @@ func TestEndToEnd_FullPipeline(t *testing.T) {
 		},
 	}
 
-	// Stats struct (same shape as in main())
-	var stats struct {
-		mu          sync.Mutex
-		connections int64
-		payloads    int64
-		errors      int64
-		throttled   int64
-	}
+	// Stats (same counters handleConnection increments)
+	var stats statsCounters
 
 	// Connection semaphore (generous limit)
 	connSem := make(chan struct{}, 100)
@@ -183,7 +175,7 @@ func TestEndToEnd_FullPipeline(t *testing.T) {
 				}
 				continue
 			}
-			atomic.AddInt64(&stats.connections, 1)
+			stats.connections.Add(1)
 			connSem <- struct{}{}
 			go handleConnection(conn, port, cfg, log, &stats, connSem)
 		}
@@ -208,17 +200,15 @@ func TestEndToEnd_FullPipeline(t *testing.T) {
 	// --- Verify ---
 
 	// Stats should show 1 connection, 1 payload
-	stats.mu.Lock()
-	if stats.connections != 1 {
-		t.Errorf("connections = %d, want 1", stats.connections)
+	if got := stats.connections.Load(); got != 1 {
+		t.Errorf("connections = %d, want 1", got)
 	}
-	if stats.payloads != 1 {
-		t.Errorf("payloads = %d, want 1", stats.payloads)
+	if got := stats.payloads.Load(); got != 1 {
+		t.Errorf("payloads = %d, want 1", got)
 	}
-	if stats.errors != 0 {
-		t.Errorf("errors = %d, want 0", stats.errors)
+	if got := stats.errors.Load(); got != 0 {
+		t.Errorf("errors = %d, want 0", got)
 	}
-	stats.mu.Unlock()
 
 	// Log file should exist and contain valid JSON
 	logFile := log.Path()
@@ -296,13 +286,7 @@ func TestEndToEnd_Throttling(t *testing.T) {
 		},
 	}
 
-	var stats struct {
-		mu          sync.Mutex
-		connections int64
-		payloads    int64
-		errors      int64
-		throttled   int64
-	}
+	var stats statsCounters
 
 	// Tiny semaphore (1 slot) to force throttling
 	connSem := make(chan struct{}, 1)
@@ -326,16 +310,14 @@ func TestEndToEnd_Throttling(t *testing.T) {
 				}
 				continue
 			}
-			atomic.AddInt64(&stats.connections, 1)
+			stats.connections.Add(1)
 
 			// Try to acquire — full semaphore means throttle
 			select {
 			case connSem <- struct{}{}:
 				go handleConnection(conn, 0, cfg, log, &stats, connSem)
 			default:
-				stats.mu.Lock()
-				stats.throttled++
-				stats.mu.Unlock()
+				stats.throttled.Add(1)
 				conn.Close()
 			}
 		}
@@ -357,14 +339,12 @@ func TestEndToEnd_Throttling(t *testing.T) {
 	conn2.Close()
 	time.Sleep(50 * time.Millisecond)
 
-	stats.mu.Lock()
-	if stats.throttled == 0 {
+	if stats.throttled.Load() == 0 {
 		t.Error("expected at least 1 throttled connection")
 	}
-	if stats.connections < 2 {
-		t.Errorf("connections = %d, want >= 2", stats.connections)
+	if stats.connections.Load() < 2 {
+		t.Errorf("connections = %d, want >= 2", stats.connections.Load())
 	}
-	stats.mu.Unlock()
 
 	cancel()
 }
@@ -393,13 +373,7 @@ func TestEndToEnd_LogHexPayloadDisabled(t *testing.T) {
 		},
 	}
 
-	var stats struct {
-		mu          sync.Mutex
-		connections int64
-		payloads    int64
-		errors      int64
-		throttled   int64
-	}
+	var stats statsCounters
 
 	connSem := make(chan struct{}, 100)
 	cancel := func() {} // no-op, ln.Close() suffices for cleanup
@@ -418,7 +392,7 @@ func TestEndToEnd_LogHexPayloadDisabled(t *testing.T) {
 			if err != nil {
 				return
 			}
-			atomic.AddInt64(&stats.connections, 1)
+			stats.connections.Add(1)
 			connSem <- struct{}{}
 			go handleConnection(conn, port, cfg, log, &stats, connSem)
 		}
@@ -478,13 +452,7 @@ func (p *panicConn) Close() error { return nil }
 func TestHandleConnection_PanicRecovery(t *testing.T) {
 	slogLogger = defaultSlogLogger()
 
-	var stats struct {
-		mu          sync.Mutex
-		connections int64
-		payloads    int64
-		errors      int64
-		throttled   int64
-	}
+	var stats statsCounters
 
 	// Create a base connection just for type assertions
 	server, _ := net.Pipe()
@@ -515,10 +483,7 @@ func TestHandleConnection_PanicRecovery(t *testing.T) {
 		t.Fatal("handleConnection hung after panic recovery")
 	}
 
-	stats.mu.Lock()
-	if stats.errors != 1 {
-		t.Errorf("errors = %d, want 1 (panic should be counted)", stats.errors)
+	if got := stats.errors.Load(); got != 1 {
+		t.Errorf("errors = %d, want 1 (panic should be counted)", got)
 	}
-	stats.mu.Unlock()
 }
-

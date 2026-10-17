@@ -282,4 +282,3 @@ func TestCapture_NonTCPNoPanic(t *testing.T) {
 		t.Errorf("expected empty SourceIP for non-TCP conn, got %q", event.SourceIP)
 	}
 }
-
