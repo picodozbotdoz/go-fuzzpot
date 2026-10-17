@@ -24,6 +24,10 @@ logging:
   file: payloads.log
   rotate_mb: 50         # rotate individual log file after this many MB
   keep_files: 10        # keep at most this many rotated files (0 = unlimited)
+  compress: false       # gzip rotated files (after compress_delay_sec, so the
+                        # analyzer can drain them while still plain text)
+  compress_delay_sec: 60
+  fsync_writes: false   # fsync after every event (durable but slow)
 
 refresh:
   interval_sec: 60  # re-scan /proc/net/tcp every 60 seconds

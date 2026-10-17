@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,20 @@ import (
 	"time"
 )
 
+// Options tunes rotation behavior (A1-7). The zero value keeps the
+// classic behavior: plain-text rotated files, no per-write fsync.
+type Options struct {
+	// Compress gzips rotated files after CompressDelaySec. The delay
+	// gives log tailers (fuzz-sec-intel) a window to drain the rotated
+	// file while it is still plain text.
+	Compress bool
+	// CompressDelaySec delays gzip compression of rotated files.
+	CompressDelaySec int
+	// FsyncWrites fsyncs the log file after every event write. Durable
+	// against power loss, but slow — leave off unless required.
+	FsyncWrites bool
+}
+
 // Logger handles writing captured events to disk with size-based rotation
 // and a cap on total disk usage (old logs are pruned).
 type Logger struct {
@@ -22,12 +37,22 @@ type Logger struct {
 	rotSize  int64 // rotate after this many bytes per file
 	maxFiles int   // keep at most this many rotated files
 	written  int64
+	opts     Options
 }
 
 // New creates a Logger, creating the log directory if needed.
 // rotSizeMB: rotate individual log file after this many MB.
 // maxFiles: keep at most this many rotated log files (0 = unlimited).
 func New(dir, filename string, rotSizeMB int, maxFiles ...int) (*Logger, error) {
+	mf := 10
+	if len(maxFiles) > 0 {
+		mf = maxFiles[0]
+	}
+	return NewWithOptions(dir, filename, rotSizeMB, mf, Options{})
+}
+
+// NewWithOptions creates a Logger with rotation tuning (see Options).
+func NewWithOptions(dir, filename string, rotSizeMB int, maxFiles int, opts Options) (*Logger, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create log dir %s: %w", dir, err)
 	}
@@ -40,20 +65,14 @@ func New(dir, filename string, rotSizeMB int, maxFiles ...int) (*Logger, error) 
 
 	info, _ := f.Stat()
 
-	mf := 10 // default when unspecified (~500MB at 50MB per file)
-	if len(maxFiles) > 0 {
-		// Explicit value, including 0 = unlimited (pruning disabled),
-		// as documented for keep_files.
-		mf = maxFiles[0]
-	}
-
 	return &Logger{
 		file:     f,
 		logPath:  path,
 		logDir:   dir,
 		rotSize:  int64(rotSizeMB) * 1024 * 1024,
-		maxFiles: mf,
+		maxFiles: maxFiles,
 		written:  info.Size(),
+		opts:     opts,
 	}, nil
 }
 
@@ -76,6 +95,9 @@ func (l *Logger) WriteEvent(event map[string]interface{}) error {
 
 	n, err := l.file.Write(line)
 	l.written += int64(n)
+	if err == nil && l.opts.FsyncWrites {
+		err = l.file.Sync()
+	}
 	return err
 }
 
@@ -100,6 +122,9 @@ func (l *Logger) WriteEventTyped(event interface{}) error {
 
 	n, err := l.file.Write(line)
 	l.written += int64(n)
+	if err == nil && l.opts.FsyncWrites {
+		err = l.file.Sync()
+	}
 	return err
 }
 
@@ -116,21 +141,50 @@ func (l *Logger) WriteRaw(line string) error {
 
 	n, err := l.file.WriteString(line + "\n")
 	l.written += int64(n)
+	if err == nil && l.opts.FsyncWrites {
+		err = l.file.Sync()
+	}
 	return err
 }
 
-// rotate renames the current log and opens a fresh one.
-// Uses copy-then-truncate for cross-device atomicity.
-func (l *Logger) rotate() error {
+// uniqueRotatedPath returns logPath.<timestamp> that does not collide with
+// an existing file. Two rotations inside the same second append -1, -2, ...
+// so the earlier backup is never overwritten (A1-7).
+func uniqueRotatedPath(logPath string) string {
 	ts := time.Now().Format("20060102-150405")
-	oldPath := fmt.Sprintf("%s.%s", l.logPath, ts)
+	candidate := fmt.Sprintf("%s.%s", logPath, ts)
+	for i := 1; ; i++ {
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s.%s-%d", logPath, ts, i)
+	}
+}
+
+// rotate moves the current log aside and opens a fresh one.
+//
+// Rotation is rename-based (A1-7): os.Rename is atomic and O(1), so the
+// write mutex is held only briefly, and the rotated file keeps its inode —
+// downstream tailers (fuzz-sec-intel's parser) locate it among the
+// log_path.* siblings and drain it to EOF without data loss. The
+// copy-then-truncate fallback is only used when rename fails (e.g. across
+// filesystems); it is slow and holds the mutex for the whole copy.
+func (l *Logger) rotate() error {
+	oldPath := uniqueRotatedPath(l.logPath)
 
 	l.file.Close()
 
-	// Cross-device safe rotation: copy then truncate
-	if err := copyThenTruncate(l.logPath, oldPath); err != nil {
-		// If copy fails, try simple rename as fallback
-		os.Rename(l.logPath, oldPath)
+	if err := os.Rename(l.logPath, oldPath); err != nil {
+		// Cross-device safe fallback: copy then truncate
+		if cerr := copyThenTruncate(l.logPath, oldPath); cerr != nil {
+			// Could not move the data aside; reopen and keep writing to
+			// the original file rather than losing the log entirely.
+			os.Rename(oldPath, l.logPath) // roll back a partial copy
+			if f, rerr := os.OpenFile(l.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640); rerr == nil {
+				l.file = f
+			}
+			return fmt.Errorf("rotate: %w (copy fallback: %v)", err, cerr)
+		}
 	}
 
 	f, err := os.OpenFile(l.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
@@ -140,9 +194,57 @@ func (l *Logger) rotate() error {
 	l.file = f
 	l.written = 0
 
+	if l.opts.Compress {
+		go l.compressRotated(oldPath)
+	}
+
 	// Prune old rotated files if we have a cap
 	l.pruneOldLogs()
 	return nil
+}
+
+// compressRotated gzips a rotated file after the configured delay and
+// removes the plain-text original. The delay gives log tailers a window
+// to drain the file while it is still plain text.
+func (l *Logger) compressRotated(path string) {
+	defer func() {
+		// Compression must never panic the process; a failed compression
+		// just leaves the plain rotated file in place (still pruned normally).
+		_ = recover()
+	}()
+	if l.opts.CompressDelaySec > 0 {
+		time.Sleep(time.Duration(l.opts.CompressDelaySec) * time.Second)
+	}
+	src, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer src.Close()
+
+	dst, err := os.Create(path + ".gz")
+	if err != nil {
+		return
+	}
+	zw := gzip.NewWriter(dst)
+	if _, err := io.Copy(zw, src); err != nil {
+		zw.Close()
+		dst.Close()
+		os.Remove(path + ".gz")
+		return
+	}
+	if err := zw.Close(); err != nil {
+		dst.Close()
+		os.Remove(path + ".gz")
+		return
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(path + ".gz")
+		return
+	}
+	// Close the source before removing it — Windows refuses to delete
+	// files that are still open (the deferred Close would be too late).
+	src.Close()
+	os.Remove(path)
 }
 
 // copyThenTruncate copies src to dst then truncates src to zero length.
@@ -168,8 +270,13 @@ func copyThenTruncate(src, dst string) error {
 	return os.Truncate(src, 0)
 }
 
+// rotatedNameRe matches rotated file names: log.TIMESTAMP[-N][.gz],
+// where TIMESTAMP is YYYYMMDD-HHMMSS (the optional -N suffix comes from
+// same-second collision avoidance).
+var rotatedNameRe = regexp.MustCompile(`\.\d{8}-\d{6}(-\d+)?(\.gz)?$`)
+
 // pruneOldLogs removes the oldest rotated log files when maxFiles is exceeded.
-// Only matches files with the expected timestamp suffix format (YYYYMMDD-HHMMSS).
+// Only matches files with the expected rotation timestamp suffix format.
 // A maxFiles of 0 or less means unlimited retention — never prune.
 func (l *Logger) pruneOldLogs() {
 	if l.maxFiles <= 0 {
@@ -182,10 +289,9 @@ func (l *Logger) pruneOldLogs() {
 	}
 
 	// Only keep files that match the expected rotation timestamp format
-	rotatedPattern := regexp.MustCompile(`\.\d{8}-\d{6}$`)
 	var validMatches []string
 	for _, m := range matches {
-		if rotatedPattern.MatchString(m) {
+		if rotatedNameRe.MatchString(m) {
 			validMatches = append(validMatches, m)
 		}
 	}

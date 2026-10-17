@@ -98,8 +98,13 @@ func main() {
 		AddSource: false,
 	}))
 
-	// Setup file logger (configurable: rotate_mb, keep_files)
-	log, err := logger.New(cfg.Logging.Dir, cfg.Logging.File, cfg.Logging.RotateMB, cfg.Logging.KeepFiles)
+	// Setup file logger (configurable: rotate_mb, keep_files, compression, fsync)
+	log, err := logger.NewWithOptions(cfg.Logging.Dir, cfg.Logging.File,
+		cfg.Logging.RotateMB, cfg.Logging.KeepFiles, logger.Options{
+			Compress:         cfg.Logging.Compress,
+			CompressDelaySec: cfg.Logging.CompressDelaySec,
+			FsyncWrites:      cfg.Logging.FsyncWrites,
+		})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logger init: %v\n", err)
 		os.Exit(1)

@@ -1,8 +1,10 @@
 package logger
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -363,5 +365,168 @@ func TestSecurityLogger_LogConflict(t *testing.T) {
 	}
 	if len(event.Ports) != 3 || event.Ports[0] != 80 {
 		t.Errorf("Ports = %v, want [80 443 8080]", event.Ports)
+	}
+}
+
+// ── A1-7: rotation overhaul ───────────────────────────────────────────
+
+// rotateNow forces a rotation cycle regardless of size (test helper).
+func rotateNow(t *testing.T, log *Logger) {
+	t.Helper()
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	if err := log.rotate(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+}
+
+// Contract test (pairs with fuzz-sec-intel TestRotationSafety): rotation
+// is rename-based — the rotated file survives under a
+// <file>.YYYYMMDD-HHMMSS sibling name with its content intact, and the
+// live log file is recreated empty, so a tailer can drain the sibling.
+func TestRotationIsRenameBased_AnalyzerCanDrain(t *testing.T) {
+	tmpDir := t.TempDir()
+	log, err := New(tmpDir, "contract.log", 10, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := log.WriteRaw("event-one"); err != nil {
+		t.Fatal(err)
+	}
+	rotateNow(t, log)
+
+	matches, _ := filepath.Glob(filepath.Join(tmpDir, "contract.log.2*"))
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one rotated sibling, got %v", matches)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "event-one\n" {
+		t.Errorf("rotated sibling content = %q, want %q", string(data), "event-one\n")
+	}
+
+	// New events go to a fresh live file, not the rotated sibling
+	if err := log.WriteRaw("event-two"); err != nil {
+		t.Fatal(err)
+	}
+	live, _ := os.ReadFile(log.Path())
+	if string(live) != "event-two\n" {
+		t.Errorf("live file after rotation = %q, want %q", string(live), "event-two\n")
+	}
+	log.Close()
+}
+
+// Same-second rotations must not overwrite each other's backups.
+func TestRotationSameSecondNoCollision(t *testing.T) {
+	tmpDir := t.TempDir()
+	log, err := New(tmpDir, "collide.log", 10, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	rotateNow(t, log)
+	rotateNow(t, log) // same wall-clock second most of the time
+
+	matches, _ := filepath.Glob(filepath.Join(tmpDir, "collide.log.*"))
+	if len(matches) < 2 {
+		t.Fatalf("same-second rotations collided: %v", matches)
+	}
+}
+
+func TestRotationCompressesAfterDelay(t *testing.T) {
+	tmpDir := t.TempDir()
+	log, err := NewWithOptions(tmpDir, "gz.log", 10, 5, Options{
+		Compress:         true,
+		CompressDelaySec: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	if err := log.WriteRaw("compress-me"); err != nil {
+		t.Fatal(err)
+	}
+	rotateNow(t, log)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var gzPath string
+	for time.Now().Before(deadline) {
+		gz, _ := filepath.Glob(filepath.Join(tmpDir, "gz.log.*.gz"))
+		plain, _ := filepath.Glob(filepath.Join(tmpDir, "gz.log.2???????-??????"))
+		if len(gz) == 1 && len(plain) == 0 {
+			gzPath = gz[0]
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if gzPath == "" {
+		t.Fatal("rotated file was not compressed to .gz (with plain file removed)")
+	}
+
+	f, err := os.Open(gzPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "compress-me\n" {
+		t.Errorf("gz content = %q, want %q", string(data), "compress-me\n")
+	}
+}
+
+func TestPruneCountsCompressedFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	log, err := New(tmpDir, "prune_gz.log", 10, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	base := filepath.Join(tmpDir, "prune_gz.log")
+	for _, name := range []string{
+		base + ".20250101-000000",
+		base + ".20250102-000000.gz",
+		base + ".20250103-000000",
+	} {
+		if err := os.WriteFile(name, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log.mu.Lock()
+	log.pruneOldLogs()
+	log.mu.Unlock()
+
+	matches, _ := filepath.Glob(base + ".*")
+	if len(matches) != 2 {
+		t.Errorf("expected 2 files kept (cap 2, .gz counted), got %d: %v", len(matches), matches)
+	}
+}
+
+func TestFsyncWritesOption(t *testing.T) {
+	tmpDir := t.TempDir()
+	log, err := NewWithOptions(tmpDir, "fsync.log", 10, 5, Options{FsyncWrites: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	if err := log.WriteRaw("durability"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(log.Path())
+	if string(data) != "durability\n" {
+		t.Errorf("content = %q", string(data))
 	}
 }

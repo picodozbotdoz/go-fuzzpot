@@ -37,6 +37,13 @@ type LoggingConfig struct {
 	File      string `yaml:"file"`
 	RotateMB  int    `yaml:"rotate_mb"`
 	KeepFiles int    `yaml:"keep_files"`
+	// Compress gzips rotated files after CompressDelaySec, giving log
+	// tailers a window to drain them while still plain text.
+	Compress bool `yaml:"compress"`
+	// CompressDelaySec delays compression of rotated files (default 60).
+	CompressDelaySec int `yaml:"compress_delay_sec"`
+	// FsyncWrites fsyncs after every event write (durable but slow).
+	FsyncWrites bool `yaml:"fsync_writes"`
 }
 
 type RefreshConfig struct {
@@ -58,10 +65,13 @@ func DefaultConfig() Config {
 			LogHexPayload:  true,
 		},
 		Logging: LoggingConfig{
-			Dir:       "/var/log/fuzzpot",
-			File:      "payloads.log",
-			RotateMB:  50,
-			KeepFiles: 10,
+			Dir:              "/var/log/fuzzpot",
+			File:             "payloads.log",
+			RotateMB:         50,
+			KeepFiles:        10,
+			Compress:         false,
+			CompressDelaySec: 60,
+			FsyncWrites:      false,
 		},
 		Refresh: RefreshConfig{
 			IntervalSec: 60,
@@ -124,6 +134,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Logging.KeepFiles < 0 {
 		return fmt.Errorf("keep_files must be >= 0")
+	}
+	if c.Logging.CompressDelaySec < 0 {
+		return fmt.Errorf("compress_delay_sec must be >= 0")
 	}
 	return nil
 }
