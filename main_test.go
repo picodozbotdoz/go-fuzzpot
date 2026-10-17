@@ -3,18 +3,110 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
 	"fuzzpot/config"
 	"fuzzpot/logger"
+	"fuzzpot/portscan"
 )
+
+// timeoutErr is a net.Error stub whose Timeout() reports the configured value.
+type timeoutErr struct{ ok bool }
+
+func (e *timeoutErr) Error() string   { return "simulated timeout" }
+func (e *timeoutErr) Timeout() bool   { return e.ok }
+func (e *timeoutErr) Temporary() bool { return e.ok }
+
+func TestIsTemporaryAcceptError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"net timeout", &timeoutErr{ok: true}, true},
+		{"wrapped net timeout", fmt.Errorf("accept: %w", &timeoutErr{ok: true}), true},
+		{"conn aborted", syscall.ECONNABORTED, true},
+		{"wrapped emfile", fmt.Errorf("accept: %w", syscall.EMFILE), true},
+		{"enfile", syscall.ENFILE, true},
+		{"eagain", syscall.EAGAIN, true},
+		{"eintr", syscall.EINTR, true},
+		{"generic error", errors.New("some permanent failure"), false},
+		{"net error without timeout", &timeoutErr{ok: false}, false},
+	}
+	for _, tc := range cases {
+		if got := isTemporaryAcceptError(tc.err); got != tc.want {
+			t.Errorf("%s: isTemporaryAcceptError() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestAcceptLoop_CtxCancelDuringIdleAccept(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+
+	// Guards the new backoff control flow: the loop must still exit
+	// promptly on ctx cancel while sitting in Accept/backoff.
+	var stats statsCounters
+	connSem := make(chan struct{}, 4)
+
+	cfg := &config.Config{
+		Capture: config.CaptureConfig{ReadTimeoutSec: 1, MaxPayloadSize: 1024},
+	}
+	tmpDir := t.TempDir()
+	log, err := logger.New(tmpDir, "backoff.log", 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	secLog, err := logger.NewSecurityLogger(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secLog.Close()
+
+	pm := portscan.NewPortManager(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	port := freeTCPPort(t)
+	done := make(chan error, 1)
+	go func() {
+		done <- listenPort(ctx, port, cfg, pm, log, secLog, &stats, connSem)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("listenPort returned error on shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("listenPort did not return after ctx cancel")
+	}
+}
+
+// freeTCPPort asks the OS for a currently free TCP port.
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+	return port
+}
 
 func TestTruncate_ShortString(t *testing.T) {
 	got := truncate("hello", 10)

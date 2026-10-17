@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,14 @@ import (
 	"fuzzpot/config"
 	"fuzzpot/logger"
 	"fuzzpot/portscan"
+)
+
+// Accept-failure handling constants: initial and capped backoff between
+// retries, and how many consecutive permanent errors trigger a listener rebind.
+const (
+	acceptBackoffInitial  = 100 * time.Millisecond
+	acceptBackoffMax      = 10 * time.Second
+	acceptRebindThreshold = 5
 )
 
 var (
@@ -262,6 +271,22 @@ func main() {
 	}
 }
 
+// isTemporaryAcceptError reports whether an Accept error is transient and
+// worth retrying on the same listener: timeouts, fd exhaustion, aborted or
+// interrupted connections. Everything else (including a closed listener)
+// counts as permanent and enters the backoff-and-rebind path.
+func isTemporaryAcceptError(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EINTR)
+}
+
 func listenPort(
 	ctx context.Context,
 	port int,
@@ -282,7 +307,22 @@ func listenPort(
 		// enlarges the receive buffer for payload bursts (Unix-only).
 		Control: listenControl,
 	}
-	listener, err := lc.Listen(ctx, "tcp", addr)
+	// bindListener listens and arranges for a parked Accept to unblock
+	// when the context is cancelled (each listener gets its own watcher,
+	// so rebinds never race the watcher).
+	bindListener := func() (net.Listener, error) {
+		l, lerr := lc.Listen(ctx, "tcp", addr)
+		if lerr != nil {
+			return nil, lerr
+		}
+		go func() {
+			<-ctx.Done()
+			l.Close()
+		}()
+		return l, nil
+	}
+
+	listener, err := bindListener()
 	if err != nil {
 		slogLogger.Error("listener_failed",
 			"port", port,
@@ -291,10 +331,17 @@ func listenPort(
 		)
 		return fmt.Errorf("port %d: %w", port, err)
 	}
-	defer listener.Close()
+	// Closure so a mid-loop listener rebind is what gets closed at exit.
+	defer func() { listener.Close() }()
 
 	pm.SetListening(port)
 	defer pm.ClearListening(port)
+
+	// Accept-failure handling: a bare continue hot-spins at 100% CPU on
+	// permanent errors. Back off exponentially, and after enough
+	// consecutive permanent errors try to rebind the listener.
+	var acceptBackoff time.Duration
+	consecutivePermanent := 0
 
 	for {
 		select {
@@ -308,8 +355,54 @@ func listenPort(
 			if ctx.Err() != nil {
 				return nil // shutdown
 			}
+
+			if acceptBackoff == 0 {
+				acceptBackoff = acceptBackoffInitial
+			}
+
+			if isTemporaryAcceptError(err) {
+				// Transient (timeout, fd exhaustion, aborted connection):
+				// pause briefly and retry on the same listener.
+				time.Sleep(acceptBackoff)
+			} else {
+				// Permanent: pause, and periodically rebind the listener
+				// in case it ended up in a broken state.
+				consecutivePermanent++
+				time.Sleep(acceptBackoff)
+				if consecutivePermanent >= acceptRebindThreshold {
+					slogLogger.Warn("listener_rebind",
+						"port", port,
+						"last_error", err.Error(),
+					)
+					listener.Close()
+					pm.ClearListening(port)
+					newLn, lerr := bindListener()
+					if lerr != nil {
+						// Keep retrying: the loop's capped backoff bounds
+						// the cost; the next Accept fails immediately on
+						// the closed listener and re-enters this path.
+						slogLogger.Error("listener_rebind_failed",
+							"port", port,
+							"error", lerr.Error(),
+						)
+					} else {
+						listener = newLn
+						pm.SetListening(port)
+					}
+					consecutivePermanent = 0
+				}
+			}
+
+			acceptBackoff *= 2
+			if acceptBackoff > acceptBackoffMax {
+				acceptBackoff = acceptBackoffMax
+			}
 			continue
 		}
+
+		// A successful accept means the listener is healthy again.
+		acceptBackoff = 0
+		consecutivePermanent = 0
 
 		stats.connections.Add(1)
 
