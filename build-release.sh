@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /home/plain/.picoclaw/workspace-default/projects/go-fuzzpot
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 VERSION="1.1.0"
 REPO="donniexyz/go-fuzzpot"
@@ -56,13 +57,13 @@ for entry in "${platforms[@]}"; do
   zip "$zipname" "$OUTPUT"
 done
 unset GOOS GOARCH GOARM
-cd /home/plain/.picoclaw/workspace-default/projects/go-fuzzpot
+cd "$SCRIPT_DIR"
 
 echo "=== Step 3: Git commit & tag ==="
-g2t add -A
-g2t commit -m "v1.1.0: multi-platform port scanning + packaging" || true
-g2t tag -f "v$VERSION"
-g2t push origin master --tags
+git add -A
+git commit -m "v1.1.0: multi-platform port scanning + packaging" || true
+git tag -f "v$VERSION"
+git push origin master --tags
 
 echo "=== Step 4: Create GitHub release ==="
 # Get upload URL from gh release create
@@ -192,7 +193,7 @@ mkdir -p "$RPMDIR/SPECS" "$RPMDIR/SOURCES" "$RPMDIR/BUILD" "$RPMDIR/RPMS"
 
 cp "$BUILDDIR/fuzzpot-linux-amd64" "$RPMDIR/SOURCES/fuzzpot"
 cp config/config.yaml "$RPMDIR/SOURCES/config.yaml"
-cp "$BUILDDIR/usr/lib/systemd/system/fuzzpot.service" "$RPMDIR/SOURCES/fuzzpot.service"
+cp "$BUILDDIR/deb/usr/lib/systemd/system/fuzzpot.service" "$RPMDIR/SOURCES/fuzzpot.service"
 
 cat > "$RPMDIR/SPECS/fuzzpot.spec" << EOF
 Name: fuzzpot
@@ -251,7 +252,7 @@ if ! ls "$BUILDDIR"/*.rpm &>/dev/null && which fpm &>/dev/null; then
     --vendor dozaibot \
     "$BUILDDIR/fuzzpot-linux-amd64=/usr/bin/fuzzpot" \
     "config/config.yaml=/etc/fuzzpot/config.yaml" \
-    "$BUILDDIR/usr/lib/systemd/system/fuzzpot.service=/usr/lib/systemd/system/fuzzpot.service"
+    "$BUILDDIR/deb/usr/lib/systemd/system/fuzzpot.service=/usr/lib/systemd/system/fuzzpot.service"
   cp fuzzpot*.rpm "$BUILDDIR/"
   echo "  → $(ls $BUILDDIR/*.rpm | xargs basename)"
 fi
@@ -266,7 +267,7 @@ cp config/config.yaml "$APKDIR/etc/fuzzpot/config.yaml"
 # Build APK data and control tarballs
 cd "$APKDIR"
 tar czf "$BUILDDIR/fuzzpot-${VERSION#v}-x86_64.apk" usr/ etc/ var/
-cd /home/plain/.picoclaw/workspace-default/projects/go-fuzzpot
+cd "$SCRIPT_DIR"
 echo "  → fuzzpot-${VERSION#v}-x86_64.apk (data tarball — use with abuild for signed package)"
 
 echo "=== Step 8: Create .tar.gz (generic Linux) ==="
@@ -274,7 +275,7 @@ TARDIR="$BUILDDIR/tar"
 mkdir -p "$TARDIR/fuzzpot-$VERSION/bin" "$TARDIR/fuzzpot-$VERSION/etc" "$TARDIR/fuzzpot-$VERSION/log"
 cp "$BUILDDIR/fuzzpot-linux-amd64" "$TARDIR/fuzzpot-$VERSION/bin/fuzzpot"
 cp config/config.yaml "$TARDIR/fuzzpot-$VERSION/etc/config.yaml"
-cp "$BUILDDIR/usr/lib/systemd/system/fuzzpot.service" "$TARDIR/fuzzpot-$VERSION/fuzzpot.service"
+cp "$BUILDDIR/deb/usr/lib/systemd/system/fuzzpot.service" "$TARDIR/fuzzpot-$VERSION/fuzzpot.service"
 cp README.md "$TARDIR/fuzzpot-$VERSION/"
 cp LICENSE "$TARDIR/fuzzpot-$VERSION/"
 
@@ -287,7 +288,7 @@ sha256sum fuzzpot*.{zip,deb,rpm,apk,gz,tar.gz} 2>/dev/null > "fuzzpot-${VERSION}
 echo "  → fuzzpot-${VERSION}-checksums.txt"
 
 echo "=== Step 10: Upload packages to GitHub release ==="
-cd /home/plain/.picoclaw/workspace-default/projects/go-fuzzpot
+cd "$SCRIPT_DIR"
 
 # Upload all package files
 for f in "$BUILDDIR"/fuzzpot_*.deb "$BUILDDIR"/fuzzpot_*.apk "$BUILDDIR"/fuzzpot-*.tar.gz "$BUILDDIR"/fuzzpot-*.rpm "$BUILDDIR"/fuzzpot-*-checksums.txt; do
