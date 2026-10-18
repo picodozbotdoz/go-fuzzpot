@@ -17,6 +17,13 @@ type Config struct {
 	Logging LoggingConfig `yaml:"logging"`
 	Refresh RefreshConfig `yaml:"refresh"`
 	Limits  LimitsConfig  `yaml:"limits"`
+	Stats   StatsConfig   `yaml:"stats"`
+}
+
+type StatsConfig struct {
+	// IntervalSec is the stats/security-aggregate tick (G12). Ten seconds
+	// matches the old hardcoded value.
+	IntervalSec int `yaml:"interval_sec"`
 }
 
 type PortsConfig struct {
@@ -96,6 +103,9 @@ func DefaultConfig() Config {
 			MemoryBudgetMB: 64,
 			MaxPerPort:     64,
 			MaxPerIP:       32,
+		},
+		Stats: StatsConfig{
+			IntervalSec: 10,
 		},
 	}
 }
@@ -188,6 +198,13 @@ func (c *Config) ReadTimeout() time.Duration {
 
 func (c *Config) RefreshInterval() time.Duration {
 	return time.Duration(c.Refresh.IntervalSec) * time.Second
+}
+
+func (c *Config) StatsInterval() time.Duration {
+	if c.Stats.IntervalSec <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(c.Stats.IntervalSec) * time.Second
 }
 
 func (c *Config) LogPath() string {

@@ -3,6 +3,7 @@ package logger
 import (
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,15 +32,22 @@ type Options struct {
 // Logger handles writing captured events to disk with size-based rotation
 // and a cap on total disk usage (old logs are pruned).
 type Logger struct {
-	mu       sync.Mutex
-	file     *os.File
-	logPath  string
-	logDir   string
-	rotSize  int64 // rotate after this many bytes per file
-	maxFiles int   // keep at most this many rotated files
-	written  int64
-	opts     Options
+	mu        sync.Mutex
+	file      *os.File
+	logPath   string
+	logDir    string
+	rotSize   int64 // rotate after this many bytes per file
+	maxFiles  int   // keep at most this many rotated files
+	written   int64
+	rotations atomic.Int64
+	opts      Options
 }
+
+// ErrLoggerClosed is returned by write paths once a failed rotation (or an
+// explicit close) has left the logger with no usable descriptor. Reporting
+// this distinctly beats letting every write fail with "file already closed"
+// from deep inside os.File (G8).
+var ErrLoggerClosed = errors.New("logger closed after failed rotation")
 
 // New creates a Logger, creating the log directory if needed.
 // rotSizeMB: rotate individual log file after this many MB.
@@ -63,7 +72,12 @@ func NewWithOptions(dir, filename string, rotSizeMB int, maxFiles int, opts Opti
 		return nil, fmt.Errorf("open log file %s: %w", path, err)
 	}
 
-	info, _ := f.Stat()
+	// G8: an ignored Stat error nil-derefs on the Size call below.
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat log file %s: %w", path, err)
+	}
 
 	return &Logger{
 		file:     f,
@@ -76,34 +90,41 @@ func NewWithOptions(dir, filename string, rotSizeMB int, maxFiles int, opts Opti
 	}, nil
 }
 
-// WriteEvent appends a JSON-line event to the log file.
-func (l *Logger) WriteEvent(event map[string]interface{}) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.rotSize > 0 && l.written >= l.rotSize {
-		if err := l.rotate(); err != nil {
-			return err
-		}
+// writeLine appends one complete line, tolerating short writes (G8).
+//
+// A short write leaves a torn half-line that the next append would
+// concatenate onto, silently corrupting two records. The pre-write offset
+// is l.written (every write goes through here, in O_APPEND mode), so the
+// recovery is to truncate back to it and retry once.
+func (l *Logger) writeLine(line []byte) error {
+	if l.file == nil {
+		return ErrLoggerClosed
 	}
-
-	line, err := json.Marshal(event)
-	if err != nil {
+	for attempt := 0; attempt < 2; attempt++ {
+		n, err := l.file.Write(line)
+		l.written += int64(n)
+		if err == nil && n == len(line) {
+			if l.opts.FsyncWrites {
+				return l.file.Sync()
+			}
+			return nil
+		}
+		if err == nil && n < len(line) {
+			// Short write with no error: cut the torn tail and retry.
+			if terr := l.file.Truncate(l.written - int64(n)); terr != nil {
+				return fmt.Errorf("short write recovery (wrote %d/%d): %w", n, len(line), terr)
+			}
+			l.written -= int64(n)
+			continue
+		}
 		return err
 	}
-	line = append(line, '\n')
-
-	n, err := l.file.Write(line)
-	l.written += int64(n)
-	if err == nil && l.opts.FsyncWrites {
-		err = l.file.Sync()
-	}
-	return err
+	return fmt.Errorf("short write persisted after retry: %d/%d bytes", len(line), len(line))
 }
 
 // WriteEventTyped appends a JSON-line event to the log file using a typed struct.
-// This is preferred over WriteEvent as json.Marshal on structs guarantees proper
-// escaping of all special characters, preventing JSON log injection.
+// This is preferred over map-based writes as json.Marshal on structs guarantees
+// proper escaping of all special characters, preventing JSON log injection.
 func (l *Logger) WriteEventTyped(event interface{}) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -120,12 +141,7 @@ func (l *Logger) WriteEventTyped(event interface{}) error {
 	}
 	line = append(line, '\n')
 
-	n, err := l.file.Write(line)
-	l.written += int64(n)
-	if err == nil && l.opts.FsyncWrites {
-		err = l.file.Sync()
-	}
-	return err
+	return l.writeLine(line)
 }
 
 // WriteRaw writes a raw string line to the log.
@@ -139,12 +155,19 @@ func (l *Logger) WriteRaw(line string) error {
 		}
 	}
 
-	n, err := l.file.WriteString(line + "\n")
-	l.written += int64(n)
-	if err == nil && l.opts.FsyncWrites {
-		err = l.file.Sync()
-	}
-	return err
+	return l.writeLine([]byte(line + "\n"))
+}
+
+// Rotations reports how many rotations this logger has performed (G12).
+func (l *Logger) Rotations() int64 {
+	return l.rotations.Load()
+}
+
+// BytesWritten reports bytes in the current log file (G12).
+func (l *Logger) BytesWritten() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.written
 }
 
 // uniqueRotatedPath returns logPath.<timestamp> that does not collide with
@@ -189,10 +212,17 @@ func (l *Logger) rotate() error {
 
 	f, err := os.OpenFile(l.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
 	if err != nil {
+		// G8: the old descriptor is closed and the data has been renamed
+		// aside — there is nothing left to write to. Park the logger in
+		// the closed state (writes return ErrLoggerClosed) instead of
+		// keeping a dead *os.File that fails with "file already closed"
+		// on every event.
+		l.file = nil
 		return fmt.Errorf("reopen log after rotate: %w", err)
 	}
 	l.file = f
 	l.written = 0
+	l.rotations.Add(1)
 
 	if l.opts.Compress {
 		go l.compressRotated(oldPath)
@@ -362,7 +392,12 @@ func (l *Logger) Reopen() error {
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.file.Close()
+	if l.file == nil {
+		return nil
+	}
+	f := l.file
+	l.file = nil
+	return f.Close()
 }
 
 // Path returns the current log file path.

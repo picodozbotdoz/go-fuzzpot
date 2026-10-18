@@ -85,10 +85,29 @@ type statsCounters struct {
 	errors       atomic.Int64
 	throttled    atomic.Int64 // connections rejected due to concurrency limit
 	bindAttempts atomic.Int64 // first bind attempt finished (success or fail)
+	zeroByte     atomic.Int64 // connections closed with no payload (G12)
+	rebinds      atomic.Int64 // listener rebinds after permanent accept errors (G12)
+	acceptErrs   atomic.Int64 // accept() failures, transient or permanent (G12)
 }
 
-func (s *statsCounters) snapshot() (connections, payloads, errs, throttled int64) {
-	return s.connections.Load(), s.payloads.Load(), s.errors.Load(), s.throttled.Load()
+// statsSnapshot is a point-in-time copy of every counter (G12 widened the
+// old 4-tuple).
+type statsSnapshot struct {
+	connections, payloads, errors, throttled    int64
+	bindAttempts, zeroByte, rebinds, acceptErrs int64
+}
+
+func (s *statsCounters) snapshot() statsSnapshot {
+	return statsSnapshot{
+		connections:  s.connections.Load(),
+		payloads:     s.payloads.Load(),
+		errors:       s.errors.Load(),
+		throttled:    s.throttled.Load(),
+		bindAttempts: s.bindAttempts.Load(),
+		zeroByte:     s.zeroByte.Load(),
+		rebinds:      s.rebinds.Load(),
+		acceptErrs:   s.acceptErrs.Load(),
+	}
 }
 
 // connectionTracker bounds the number of concurrent handlers and tracks their
@@ -462,9 +481,10 @@ func (a *app) watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 				a.reopenLogs()
 			default:
 				// health-check signal (the only other registered kind)
-				conn, pay, errs, throt := a.stats.snapshot()
-				fmt.Fprintf(os.Stderr, "  [health] listening=%d connections=%d payloads=%d errors=%d throttled=%d\n",
-					a.pm.ListeningCount(), conn, pay, errs, throt)
+				s := a.stats.snapshot()
+				fmt.Fprintf(os.Stderr, "  [health] listening=%d connections=%d payloads=%d zero-byte=%d errors=%d accept-errors=%d rebinds=%d throttled=%d rotations=%d log-bytes=%d\n",
+					a.pm.ListeningCount(), s.connections, s.payloads, s.zeroByte, s.errors,
+					s.acceptErrs, s.rebinds, s.throttled, a.log.Rotations(), a.log.BytesWritten())
 			}
 		}
 	}()
@@ -502,7 +522,7 @@ func (a *app) run(ctx context.Context) error {
 		return errors.New("app: loggers must be attached before run")
 	}
 
-	statsWriter := time.NewTicker(10 * time.Second)
+	statsWriter := time.NewTicker(a.cfg.StatsInterval()) // configurable tick (G12)
 	defer statsWriter.Stop()
 	go a.reportStats(ctx, statsWriter)
 
@@ -588,20 +608,26 @@ func (a *app) reportStats(ctx context.Context, ticker *time.Ticker) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			conn, pay, errs, throt := a.stats.snapshot()
-			if throt > lastThrottled && a.secLog != nil {
-				a.secLog.LogThrottledBulk(int(throt - lastThrottled))
-				lastThrottled = throt
+			s := a.stats.snapshot()
+			if s.throttled > lastThrottled && a.secLog != nil {
+				a.secLog.LogThrottledBulk(int(s.throttled - lastThrottled))
+				lastThrottled = s.throttled
 			}
 			listening := a.pm.ListeningCount()
-			fmt.Fprintf(os.Stderr, "  [stats] listening:%d  connections:%d  payloads:%d  errors:%d  throttled:%d\n",
-				listening, conn, pay, errs, throt)
+			fmt.Fprintf(os.Stderr, "  [stats] listening:%d  connections:%d  payloads:%d  zero-byte:%d  errors:%d  accept-errors:%d  rebinds:%d  throttled:%d  rotations:%d  log-bytes:%d\n",
+				listening, s.connections, s.payloads, s.zeroByte, s.errors,
+				s.acceptErrs, s.rebinds, s.throttled, a.log.Rotations(), a.log.BytesWritten())
 			slogLogger.Info("stats_tick",
 				"listening_ports", listening,
-				"connections_total", conn,
-				"payloads_captured", pay,
-				"errors_total", errs,
-				"connections_throttled", throt,
+				"connections_total", s.connections,
+				"payloads_captured", s.payloads,
+				"zero_byte_connections", s.zeroByte,
+				"errors_total", s.errors,
+				"accept_errors_total", s.acceptErrs,
+				"listener_rebinds", s.rebinds,
+				"connections_throttled", s.throttled,
+				"log_rotations", a.log.Rotations(),
+				"log_bytes_written", a.log.BytesWritten(),
 			)
 		}
 	}
@@ -656,14 +682,17 @@ func (a *app) drain(listeners *sync.WaitGroup) {
 		slogLogger.Warn("log_sync_failed", "error", err.Error())
 	}
 
-	conn, pay, errs, throt := a.stats.snapshot()
-	fmt.Fprintf(os.Stderr, "  [*] Final: connections=%d payloads=%d errors=%d throttled=%d\n",
-		conn, pay, errs, throt)
+	s := a.stats.snapshot()
+	fmt.Fprintf(os.Stderr, "  [*] Final: connections=%d payloads=%d zero-byte=%d errors=%d accept-errors=%d rebinds=%d throttled=%d\n",
+		s.connections, s.payloads, s.zeroByte, s.errors, s.acceptErrs, s.rebinds, s.throttled)
 	slogLogger.Info("fuzzpot_shutdown",
-		"connections_total", conn,
-		"payloads_captured", pay,
-		"errors_total", errs,
-		"connections_throttled", throt,
+		"connections_total", s.connections,
+		"payloads_captured", s.payloads,
+		"zero_byte_connections", s.zeroByte,
+		"errors_total", s.errors,
+		"accept_errors_total", s.acceptErrs,
+		"listener_rebinds", s.rebinds,
+		"connections_throttled", s.throttled,
 	)
 	fmt.Fprintln(os.Stderr, "  [*] Done.")
 }
@@ -673,6 +702,11 @@ func (a *app) drain(listeners *sync.WaitGroup) {
 // our own listeners, so the old comparison reported every bound port on every
 // tick and rolled security.log within hours.
 func (a *app) checkConflicts() {
+	// G13: the ephemeral range can change at runtime (e.g. a widened
+	// sysctl); the ticker exists for exactly this refresh, but nothing
+	// ever called it.
+	a.pm.RefreshEphemeralRange()
+
 	conflicts := a.pm.DetectConflicts()
 	if len(conflicts) == 0 {
 		return
@@ -803,6 +837,7 @@ func listenPort(
 			if ctx.Err() != nil {
 				return nil // shutdown
 			}
+			stats.acceptErrs.Add(1)
 
 			if acceptBackoff == 0 {
 				acceptBackoff = acceptBackoffInitial
@@ -818,6 +853,7 @@ func listenPort(
 				consecutivePermanent++
 				time.Sleep(acceptBackoff)
 				if consecutivePermanent >= acceptRebindThreshold {
+					stats.rebinds.Add(1)
 					slogLogger.Warn("listener_rebind",
 						"port", port,
 						"last_error", err.Error(),
@@ -940,6 +976,8 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
 		// Console output, rate-limited: see hitReporter.
 		hits.report(event.SourceIP, event.SourcePort, port,
 			event.Size, event.Printable)
+	} else {
+		stats.zeroByte.Add(1)
 	}
 }
 

@@ -46,33 +46,12 @@ func getUsedPortsWindows() map[int]bool {
 		}
 		// Local address field: 0.0.0.0:80 or [::]:80
 		localAddr := fields[1]
-		if port := parseWindowsAddr(localAddr); port > 0 {
+		if port := parseAddrPort(localAddr); port > 0 {
 			used[port] = true
 		}
 	}
 
 	return used
-}
-
-func parseWindowsAddr(addr string) int {
-	// Handle [::]:80 format
-	if strings.HasPrefix(addr, "[") {
-		if idx := strings.LastIndex(addr, "]:"); idx >= 0 {
-			p, err := strconv.Atoi(addr[idx+2:])
-			if err == nil && p > 0 {
-				return p
-			}
-		}
-		return 0
-	}
-	// Handle 0.0.0.0:80 format
-	if idx := strings.LastIndex(addr, ":"); idx >= 0 {
-		p, err := strconv.Atoi(addr[idx+1:])
-		if err == nil && p > 0 {
-			return p
-		}
-	}
-	return 0
 }
 
 // EphemeralRange returns sensible defaults for Windows.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -165,16 +166,14 @@ func TestRotate_CreatesTimestampedBackup(t *testing.T) {
 	if len(matches) == 0 {
 		t.Fatal("expected rotated file")
 	}
-	// Pattern should be YYYYMMDD-HHMMSS
-	match := matches[0]
-	if len(match) < 16 {
-		t.Fatalf("rotated filename %q doesn't have timestamp suffix", match)
-	}
-	ts := match[len(match)-15:]
-	t.Logf("found rotated file: %s (timestamp suffix: %s)", match, ts)
-	// Just verify the suffix looks like a timestamp pattern
-	if len(ts) != 15 || ts[8] != '-' {
-		t.Errorf("timestamp suffix %q doesn't match YYYYMMDD-HHMMSS pattern", ts)
+	// G14: validate against the same pattern rotate() produces —
+	// YYYYMMDD-HHMMSS with an optional same-second collision suffix
+	// (-1, -2, ...). Slicing a fixed 15-char tail broke on those.
+	for _, match := range matches {
+		t.Logf("found rotated file: %s", match)
+		if !rotatedNameRe.MatchString(match) {
+			t.Errorf("rotated filename %q doesn't match the rotation pattern", match)
+		}
 	}
 }
 
@@ -554,5 +553,78 @@ func TestSync_FlushesPendingWrite(t *testing.T) {
 	}
 	if err := log.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// ── G8: closed-logger semantics ────────────────────────────────────────────
+
+func TestWriteAfterCloseReturnsErrLoggerClosed(t *testing.T) {
+	dir := t.TempDir()
+	l, err := New(dir, "closed.log", 10, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.WriteRaw("x"); err != ErrLoggerClosed {
+		t.Errorf("WriteRaw after Close = %v, want ErrLoggerClosed", err)
+	}
+	if err := l.Sync(); err != nil {
+		t.Errorf("Sync on a closed logger must be a no-op, got %v", err)
+	}
+	// Reopen recovers the logger after an external close.
+	if err := l.Reopen(); err != nil {
+		t.Fatalf("Reopen after Close: %v", err)
+	}
+	defer l.Close()
+	if err := l.WriteRaw("recovered"); err != nil {
+		t.Errorf("WriteRaw after Reopen: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "closed.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "recovered") {
+		t.Error("post-reopen write did not land")
+	}
+}
+
+// ── A3-17: benchmarks for the hot path ─────────────────────────────────────
+
+func BenchmarkWriteEventTyped(b *testing.B) {
+	dir := b.TempDir()
+	l, err := New(dir, "bench.log", 100, 3)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer l.Close()
+	entry := map[string]interface{}{
+		"ts": "2026-10-19T03:41:02.483921087Z", "src_ip": "203.0.113.7",
+		"src_port": 54321, "dst_port": 2222, "proto": "tcp", "size": 48,
+		"printable": "SSH-2.0-libssh", "hex": "5353482d322e30",
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := l.WriteEventTyped(entry); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkLoggerRotations(b *testing.B) {
+	// writeLine throughput at the 4 KB payload scale of a real event line
+	dir := b.TempDir()
+	l, err := New(dir, "bench.log", 100, 3)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer l.Close()
+	line := strings.Repeat("a", 4096)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := l.WriteRaw(line); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

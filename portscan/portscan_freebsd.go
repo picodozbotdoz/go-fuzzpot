@@ -62,22 +62,6 @@ func parseNetstat(data []byte, used map[int]bool) {
 	}
 }
 
-func parseAddrPort(addr string) int {
-	// Handle formats: *:80, 0.0.0.0:80, *.80, 127.0.0.1.80
-	if idx := strings.LastIndex(addr, ":"); idx >= 0 {
-		p, err := strconv.Atoi(addr[idx+1:])
-		if err == nil && p > 0 {
-			return p
-		}
-	} else if idx := strings.LastIndex(addr, "."); idx >= 0 {
-		p, err := strconv.Atoi(addr[idx+1:])
-		if err == nil && p > 0 {
-			return p
-		}
-	}
-	return 0
-}
-
 // EphemeralRange reads net.inet.ip.portrange.first/last sysctl on FreeBSD.
 func EphemeralRange() (int, int, error) {
 	lo, err := sysctlInt("net.inet.ip.portrange.first")

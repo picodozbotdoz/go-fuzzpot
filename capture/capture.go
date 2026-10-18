@@ -3,18 +3,20 @@ package capture
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net"
 	"time"
 )
 
 // Event represents a single captured payload from an attacker.
+//
+// The listener's port is not part of the event: capture is per-connection
+// and the port arrives as a parameter where the LogEntry is built (G13
+// removed the never-populated DestPort field).
 type Event struct {
 	Timestamp     time.Time `json:"timestamp"` // first byte received
 	SourceIP      string    `json:"source_ip"`
 	SourcePort    int       `json:"source_port"`
-	DestPort      int       `json:"dest_port"`
 	Proto         string    `json:"proto"`                    // "tcp"
 	Size          int       `json:"size"`                     // bytes received
 	Hex           string    `json:"hex"`                      // hex dump of payload
@@ -26,17 +28,11 @@ type Event struct {
 
 func (e Event) String() string {
 	return fmt.Sprintf(
-		"[%s] %s:%d → :%d (%s) %d bytes → %s",
+		"[%s] %s:%d (%s) %d bytes → %s",
 		e.Timestamp.Format("2006-01-02 15:04:05.000"),
-		e.SourceIP, e.SourcePort, e.DestPort,
+		e.SourceIP, e.SourcePort,
 		e.Proto, e.Size, e.Printable,
 	)
-}
-
-// JSONLine returns the event as a compact JSON line for log files.
-func (e Event) JSONLine() string {
-	b, _ := json.Marshal(e)
-	return string(b)
 }
 
 // Capture reads from the connection until timeout or buffer full.

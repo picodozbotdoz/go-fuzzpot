@@ -2,6 +2,8 @@ package portscan
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -137,4 +139,23 @@ func (pm *PortManager) RefreshEphemeralRange() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.ephLo, pm.ephHi, _ = EphemeralRange()
+}
+
+// parseAddrPort extracts the port from a local-address string as reported
+// by the platform tools. One shared implementation for every OS variant
+// (G13 — freebsd and windows each carried a private copy):
+// "*:80", "0.0.0.0:80", "[::]:80", "*.80" (sockstat), "127.0.0.1.80".
+func parseAddrPort(addr string) int {
+	sep := strings.LastIndex(addr, ":")
+	if sep < 0 {
+		sep = strings.LastIndex(addr, ".")
+	}
+	if sep < 0 {
+		return 0
+	}
+	p, err := strconv.Atoi(addr[sep+1:])
+	if err != nil || p <= 0 {
+		return 0
+	}
+	return p
 }
