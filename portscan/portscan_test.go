@@ -43,23 +43,42 @@ func TestPortManager_TargetPorts_ExcludesCorrectly(t *testing.T) {
 
 func TestPortManager_DetectConflicts(t *testing.T) {
 	pm := NewPortManager(nil)
-
-	// Simulate listening on ports 8080, 9090
 	pm.SetListening(8080)
 	pm.SetListening(9090)
-	pm.SetListening(7777) // not in used map
 
-	// Mock used ports: 8080 now claimed by system
+	// Healthy listeners are never conflicts. The system socket table lists
+	// our own sockets, so the old comparison reported every bound port on
+	// every tick.
 	original := GetUsedPorts
 	GetUsedPorts = func() map[int]bool {
-		return map[int]bool{8080: true} // 9090 and 7777 not used
+		return map[int]bool{8080: true, 9090: true}
 	}
 	t.Cleanup(func() { GetUsedPorts = original })
 
-	conflicts := pm.DetectConflicts()
+	if got := pm.DetectConflicts(); len(got) != 0 {
+		t.Fatalf("healthy listeners reported as conflicts: %v", got)
+	}
 
-	if len(conflicts) != 1 || conflicts[0] != 8080 {
-		t.Errorf("DetectConflicts() = %v, want [8080]", conflicts)
+	// A listener that died and could not be rebound is the real signal.
+	pm.MarkLost(9090)
+	if got := pm.DetectConflicts(); len(got) != 1 || got[0] != 9090 {
+		t.Fatalf("DetectConflicts() = %v, want [9090]", got)
+	}
+
+	// Reported once, then cleared.
+	if got := pm.DetectConflicts(); len(got) != 0 {
+		t.Fatalf("conflicts not cleared after reporting: %v", got)
+	}
+
+	// A lost port no longer counts as listening.
+	if n := pm.ListeningCount(); n != 1 {
+		t.Fatalf("ListeningCount() = %d, want 1", n)
+	}
+
+	// A successful rebind restores it.
+	pm.SetListening(9090)
+	if n := pm.ListeningCount(); n != 2 {
+		t.Fatalf("ListeningCount() after rebind = %d, want 2", n)
 	}
 }
 

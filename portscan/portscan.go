@@ -1,6 +1,9 @@
 package portscan
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // IsEphemeral checks if a port falls within the ephemeral range.
 func IsEphemeral(port int, ephLo, ephHi int) bool {
@@ -17,6 +20,7 @@ type PortManager struct {
 	mu           sync.RWMutex
 	listenPorts  map[int]struct{} // ports we're currently listening on
 	excludePorts map[int]struct{} // user-configured excludes
+	lostPorts    map[int]struct{} // listeners that died and could not be rebound
 	ephLo, ephHi int              // ephemeral range
 }
 
@@ -24,6 +28,7 @@ func NewPortManager(exclude []int) *PortManager {
 	pm := &PortManager{
 		listenPorts:  make(map[int]struct{}),
 		excludePorts: make(map[int]struct{}),
+		lostPorts:    make(map[int]struct{}),
 	}
 	for _, p := range exclude {
 		pm.excludePorts[p] = struct{}{}
@@ -91,21 +96,40 @@ func (pm *PortManager) ListeningCount() int {
 	return len(pm.listenPorts)
 }
 
-// DetectConflicts checks if any of our listen ports have been claimed
-// by a new system service. Returns ports that should be released.
-// FIX: Snapshot used ports inside lock to prevent TOCTOU race.
+// MarkLost records that a listener we had bound stopped accepting and could
+// not be rebound. The port leaves the listened set so a later successful
+// rebind re-adds it.
+func (pm *PortManager) MarkLost(port int) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	delete(pm.listenPorts, port)
+	pm.lostPorts[port] = struct{}{}
+}
+
+// DetectConflicts returns ports whose listener died since the last call, then
+// clears them.
+//
+// The previous implementation compared our listen set against GetUsedPorts(),
+// a system-wide socket table that includes our own listeners. Every bound port
+// was therefore reported as a conflict on every refresh tick — thousands of
+// ports per minute into security.log, rolling the audit trail away in hours.
+// A port we hold cannot be claimed by another process, so the only meaningful
+// signal is that our own listener stopped.
 func (pm *PortManager) DetectConflicts() []int {
 	pm.mu.Lock()
-	used := GetUsedPorts()
+	defer pm.mu.Unlock()
 
-	var conflicts []int
-	for p := range pm.listenPorts {
-		if used[p] {
-			conflicts = append(conflicts, p)
-		}
+	if len(pm.lostPorts) == 0 {
+		return nil
 	}
-	pm.mu.Unlock()
-	return conflicts
+
+	ports := make([]int, 0, len(pm.lostPorts))
+	for p := range pm.lostPorts {
+		ports = append(ports, p)
+		delete(pm.lostPorts, p)
+	}
+	sort.Ints(ports)
+	return ports
 }
 
 // RefreshEphemeralRange re-reads the ephemeral range from the platform.

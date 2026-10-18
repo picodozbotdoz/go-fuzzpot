@@ -513,22 +513,22 @@ func (a *app) drain(listeners *sync.WaitGroup) {
 	fmt.Fprintln(os.Stderr, "  [*] Done.")
 }
 
-// checkConflicts re-scans for ports claimed by the system since startup.
+// checkConflicts reports listeners that died and could not be rebound.
+// It deliberately does not diff the system socket table: that table contains
+// our own listeners, so the old comparison reported every bound port on every
+// tick and rolled security.log within hours.
 func (a *app) checkConflicts() {
 	conflicts := a.pm.DetectConflicts()
 	if len(conflicts) == 0 {
 		return
 	}
 	a.secLog.LogConflict(conflicts)
-	fmt.Fprintf(os.Stderr, "  [!] %d port conflicts detected (claimed by system): %v\n",
+	fmt.Fprintf(os.Stderr, "  [!] %d listener(s) lost, rebind pending: %v\n",
 		len(conflicts), conflicts)
 	slogLogger.Warn("port_conflicts_detected",
 		"conflict_count", len(conflicts),
 		"conflict_ports", conflicts,
 	)
-	// Note: closed listeners auto-recover on next restart. For runtime
-	// recovery we would need a listener registry — kept simple because
-	// conflicts are rare.
 }
 
 // printBanner writes the startup banner.
@@ -662,6 +662,10 @@ func listenPort(
 							"port", port,
 							"error", lerr.Error(),
 						)
+						// Surface it as a real conflict; the periodic scan
+						// reports lost listeners, not the system socket
+						// table (which contains our own sockets).
+						pm.MarkLost(port)
 					} else {
 						listener = newLn
 						pm.SetListening(port)
