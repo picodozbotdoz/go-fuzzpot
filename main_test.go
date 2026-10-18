@@ -98,6 +98,32 @@ func TestAcceptLoop_CtxCancelDuringIdleAccept(t *testing.T) {
 }
 
 // freeTCPPort asks the OS for a currently free TCP port.
+// TestMain keeps every test binary off non-loopback interfaces.
+//
+// `go test` executes the package binary from a new %TEMP%\go-build* directory
+// each run, and Windows Firewall prompts once per executable path when it
+// listens on a wildcard address. Binding 127.0.0.1 avoids the prompt entirely
+// while still exercising the real listen/accept path.
+func TestMain(m *testing.M) {
+	listenHost = "127.0.0.1"
+	os.Exit(m.Run())
+}
+
+func TestListenAddress(t *testing.T) {
+	prev := listenHost
+	t.Cleanup(func() { listenHost = prev })
+
+	listenHost = ""
+	if got := listenAddress(8080); got != ":8080" {
+		t.Fatalf("production address = %q, want \":8080\"", got)
+	}
+
+	listenHost = "127.0.0.1"
+	if got := listenAddress(8080); got != "127.0.0.1:8080" {
+		t.Fatalf("test address = %q, want \"127.0.0.1:8080\"", got)
+	}
+}
+
 func freeTCPPort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

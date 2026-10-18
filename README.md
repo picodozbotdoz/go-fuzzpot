@@ -177,6 +177,28 @@ Each captured payload is one JSON line:
 {"ts":"2026-04-17T21:15:03.000+07:00","src_ip":"185.220.101.42","src_port":54321,"dst_port":3389,"proto":"tcp","size":48,"printable":"\x03\x00\x00*ÛÈ\x00\x00\x00\x00\x00Cookie: mstshash=test","hex":"0300002bdbc8000000000000000000000436f6f6b69653a206d737473686173683d74657374"}
 ```
 
+## Development & tests
+
+```bash
+gofmt -l . && go vet ./... && go test ./...
+```
+
+Test binaries bind **127.0.0.1 only** (`TestMain` sets `listenHost`). This is a
+Windows requirement, not a preference: `go test` executes the package binary
+from a fresh `%TEMP%\go-build*` directory on every run, and Windows Firewall
+prompts once per executable path when a program listens on a wildcard address
+— so a `:port` bind in a test pops a dialog on every single run. Keep new
+tests on loopback. Production is unchanged: `listenHost` is empty outside
+tests, so the sensor binds all interfaces.
+
+To run the same test binary repeatedly without the toolchain rebuilding it
+into a new temp directory:
+
+```bash
+go test -c -o bin/fuzzpot.test.exe .
+./bin/fuzzpot.test.exe -test.v
+```
+
 ## Project Structure
 
 ```

@@ -563,6 +563,21 @@ func isTemporaryAcceptError(err error) bool {
 		errors.Is(err, syscall.EINTR)
 }
 
+// listenHost is the interface listenPort binds to. Empty means every
+// interface, which is what a real sensor wants.
+//
+// Tests set it to "127.0.0.1" in TestMain. This is not cosmetic: Windows
+// Firewall prompts per executable path the first time it listens on a
+// non-loopback address, and `go test` runs the test binary from a fresh
+// %TEMP%\go-build* directory on every invocation -- so a wildcard bind means
+// a firewall dialog on every single test run.
+var listenHost = ""
+
+// listenAddress builds the bind address for a port.
+func listenAddress(port int) string {
+	return net.JoinHostPort(listenHost, strconv.Itoa(port))
+}
+
 func listenPort(
 	ctx context.Context,
 	port int,
@@ -574,7 +589,7 @@ func listenPort(
 	conns *connectionTracker,
 	hits *hitReporter,
 ) error {
-	addr := ":" + strconv.Itoa(port)
+	addr := listenAddress(port)
 
 	lc := net.ListenConfig{
 		// The pending-connection queue length is the listen(2) backlog
