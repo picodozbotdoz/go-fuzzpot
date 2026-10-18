@@ -47,6 +47,18 @@ Companion file: `repo/fuzz-sec-intel/docs/ROADMAP_1017.md` (sections B0–B4 + C
 
 - [x] **D-1 Windows build broken by unix.Getrlimit** (found 2026-10-18 during A0-3): main.go queried RLIMIT_NOFILE unconditionally; `unix.Rlimit`/`Getrlimit`/`SetsockoptInt` and `syscall.SIGUSR1` are undefined on windows in x/sys → `go vet`/`go build` failed on Windows. ✅ Fixed same day: platform split `platform_unix.go`/`platform_windows.go` (`maxConnections()`, `healthSignals()`, `listenControl`); main.go no longer imports x/sys. Cross-compile verified linux/freebsd/darwin; `go test ./...` green on Windows. Sub-fixes: `filepath.Join` in logger.New and Config.LogPath (+2 tests updated from hardcoded `/`).
 
+- [x] **D-2 Conflict detector is self-referential** (found 2026-10-18, review): `DetectConflicts` (`portscan/portscan.go:97-109`) tests our own `listenPorts` against `/proc/net/tcp`, which includes our own sockets → all ~4000 ports reported as conflicts every 60 s (~24 KB/min into `security.log`, rolling the 30×10 MB audit trail in <9 h). Fix: diff against a startup snapshot of foreign ports, or detect own-listener death via bind/accept failure. **Supersedes A1-11 as written.** ✅ 9e33fc3 — `MarkLost` + listener-death semantics; test rewritten.
+- [ ] **D-3 Shutdown drain order inverted** (found 2026-10-18, review): `main.go:492-502` awaits handlers before listeners, so a late accept can `wg.Add(1)` after the counter hits 0 and write after `log.Close()`; `Sync()` is still missing. Order: listeners → `conns.wait()` → `Sync()` → close. Closes A1-6.
+- [ ] **D-4 No in-flight byte budget** (found 2026-10-18, review): ~0.45 MB per 64 KB event × 4096 slots ≫ `MemoryMax=128M`; a slow-drip sender OOM-kills the sensor. Add a global byte budget, derive slots from `MemoryMax`, default `max_payload_size` 16 KB.
+- [ ] **D-5 No per-source fairness** (found 2026-10-18, review): one flooded port or ~409 conn/s starves every other port for the full 10 s deadline. Per-IP/per-port counters + short idle deadline.
+- [ ] **D-6 `max_payload_size` is not a hard cap** (found 2026-10-18, review): 4096-byte reads overshoot by up to 4095 and truncation is invisible. Read `min(remaining, …)`; add `truncated` to `LogEntry` + schema v2 (paired with sec-intel contract test).
+- [ ] **D-7 `ts` is completion time at 1 s resolution** (found 2026-10-18, review): taken after EOF/timeout, `RFC3339` without fractions, while the fixture advertises ms. Record first-byte time, `RFC3339Nano`, document in `contract/README.md`.
+- [ ] **D-8 Logger error paths are unrecoverable** (found 2026-10-18, review): short write leaves a torn JSONL line; failed reopen leaves the descriptor closed forever; `f.Stat()` nil-deref (`logger/logger.go:66,96-101,175-195`).
+- [ ] **D-9 Readiness and exit codes lie** (found 2026-10-18, review): banner counts targets, not successful binds; total bind failure exits 0 (`main.go:418,480`).
+- [ ] **D-10 SIGHUP terminates the sensor** (found 2026-10-18, review): unregistered signal; logrotate rename strands writes on the old inode. Treat as reopen-by-path.
+- [ ] **D-11 Config validation gaps** (found 2026-10-18, review): non-strict YAML hides typos, unbounded `max_payload_size`, unvalidated `logging.dir`/`file` (`config/config.go:93,126-128`).
+- [ ] **D-12 Throttle path blocks accept** (found 2026-10-18, review): mutex + write + rotation check on the accept goroutine, attacker-controlled volume (`main.go:692`).
+
 ## Benchmarks
 
 _(record capture/sec numbers per release here as A3-16 lands)_
@@ -60,3 +72,4 @@ _(record capture/sec numbers per release here as A3-16 lands)_
 - 2026-10-18: roadmap materialized from engagement brief (Step 0).
 
 - 2026-10-18 (B1-8 cross-repo, landed): `v:1` field in every LogEntry; contract/log_schema.json + sample fixture byte-identical in both repos; contract tests run under both gates.
+- 2026-10-18 (review): appended D-2..D-12 from `outputs/engineering/PROJECT_REVIEW_2026-10-18.md`; marked A1-11 invalid as written (superseded by D-2) and A1-6 closable via D-3. No items deleted.
