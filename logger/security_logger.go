@@ -19,6 +19,7 @@ type SecurityEvent struct {
 	RemoteAddr string            `json:"remote_addr,omitempty"`
 	Port       int               `json:"port,omitempty"`
 	Ports      []int             `json:"ports,omitempty"`
+	Count      int               `json:"count,omitempty"` // aggregate events (G7)
 }
 
 // SecurityLogger wraps Logger for security-relevant events.
@@ -38,12 +39,31 @@ func NewSecurityLogger(dir string) (*SecurityLogger, error) {
 }
 
 // LogThrottled logs a connection throttling event when the connection limit is reached.
+//
+// Kept for low-rate, attributable rejections (tests, manual runs). The
+// accept path must not call it: per-event I/O with attacker-controlled
+// volume stalls the listener (G7) — use LogThrottledBulk from a reporter.
 func (sl *SecurityLogger) LogThrottled(remoteAddr string, port int) {
 	event := SecurityEvent{
 		EventType:  EventThrottled,
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 		RemoteAddr: remoteAddr,
 		Port:       port,
+	}
+	sl.WriteEventTyped(event)
+}
+
+// LogThrottledBulk records that count connections were rejected between
+// reporter ticks. Aggregate-only on purpose: under flood the accept loop
+// only increments a counter and this write happens off that path (G7).
+func (sl *SecurityLogger) LogThrottledBulk(count int) {
+	if count <= 0 {
+		return
+	}
+	event := SecurityEvent{
+		EventType: EventThrottled,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Count:     count,
 	}
 	sl.WriteEventTyped(event)
 }

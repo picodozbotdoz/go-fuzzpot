@@ -77,11 +77,14 @@ type LogEntry struct {
 
 // statsCounters holds process-lifetime counters. All fields are atomic and
 // must only be read via snapshot, so no mixed mutex/atomic access can race.
+// bindAttempts is startup-phase state and is additionally read directly via
+// Load while run() waits for the initial bind sweep (G9).
 type statsCounters struct {
-	connections atomic.Int64
-	payloads    atomic.Int64
-	errors      atomic.Int64
-	throttled   atomic.Int64 // connections rejected due to concurrency limit
+	connections  atomic.Int64
+	payloads     atomic.Int64
+	errors       atomic.Int64
+	throttled    atomic.Int64 // connections rejected due to concurrency limit
+	bindAttempts atomic.Int64 // first bind attempt finished (success or fail)
 }
 
 func (s *statsCounters) snapshot() (connections, payloads, errs, throttled int64) {
@@ -426,12 +429,14 @@ func portRanges(cfg *config.Config) [][2]int {
 	return ranges
 }
 
-// handleSignals wires SIGINT/SIGTERM to cancel and the platform health signal
-// (SIGUSR1 on Unix, nothing on Windows) to an on-demand stats dump. The
+// handleSignals wires SIGINT/SIGTERM to cancel, the platform health signal
+// (SIGUSR1 on Unix, nothing on Windows) to an on-demand stats dump, and
+// SIGHUP to a log reopen (G10: logrotate renames the file out from under
+// the sensor; without a reopen, writes land on the unlinked inode). The
 // returned function detaches the watcher.
 func (a *app) handleSignals(cancel context.CancelFunc) func() {
 	sigCh := make(chan os.Signal, 1)
-	notifySignals := append([]os.Signal{syscall.SIGINT, syscall.SIGTERM}, healthSignals()...)
+	notifySignals := append([]os.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP}, healthSignals()...)
 	signal.Notify(sigCh, notifySignals...)
 
 	a.watchSignals(sigCh, cancel)
@@ -453,6 +458,8 @@ func (a *app) watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 				fmt.Fprintln(os.Stderr, "\n  [*] Shutting down...")
 				cancel()
 				return
+			case syscall.SIGHUP:
+				a.reopenLogs()
 			default:
 				// health-check signal (the only other registered kind)
 				conn, pay, errs, throt := a.stats.snapshot()
@@ -461,6 +468,28 @@ func (a *app) watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 			}
 		}
 	}()
+}
+
+// reopenLogs re-opens both log files by path (G10). A failed reopen is
+// logged but not fatal: the next SIGHUP retries, and the old descriptor
+// keeps receiving writes where that is still possible.
+func (a *app) reopenLogs() {
+	for name, l := range map[string]interface {
+		Reopen() error
+	}{"payload_log": a.log, "security_log": a.secLog} {
+		if l == nil {
+			continue
+		}
+		if err := l.Reopen(); err != nil {
+			fmt.Fprintf(os.Stderr, "  [!] reopen %s failed: %v\n", name, err)
+			slogLogger.Error("log_reopen_failed",
+				"log", name,
+				"error", err.Error(),
+			)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "  [*] Reopened %s\n", name)
+	}
 }
 
 // run starts the stats reporter and the listeners, then supervises them until
@@ -479,7 +508,26 @@ func (a *app) run(ctx context.Context) error {
 
 	listeners := a.startListeners(ctx)
 
-	fmt.Fprintf(os.Stderr, "  [*] Ready. Listening on %d ports.\n\n", len(a.targets))
+	// G9: "Listening on N ports" used to echo the target count while the
+	// process could be bound to nothing and still exit 0. Wait for the
+	// initial bind sweep (goroutine starts are staggered), then report
+	// what is actually held and fail the run when nothing bound.
+	a.waitForBindSweep(ctx)
+
+	bound := int64(a.pm.ListeningCount())
+	targets := int64(len(a.targets))
+	if bound == 0 && targets > 0 {
+		return fmt.Errorf("no ports could be bound (0 of %d targets)", targets)
+	}
+	if bound < targets {
+		fmt.Fprintf(os.Stderr, "  [!] Partial bind: %d of %d target ports held; failed ports are retried by the rebind loop\n",
+			bound, targets)
+		slogLogger.Warn("partial_bind",
+			"bound_ports", bound,
+			"target_ports", targets,
+		)
+	}
+	fmt.Fprintf(os.Stderr, "  [*] Ready. Bound %d of %d target ports.\n\n", bound, targets)
 
 	// Validate() already rejects interval_sec < 5 for loaded configs, but run()
 	// is also reachable from tests and future embedders, and time.NewTicker
@@ -502,16 +550,49 @@ func (a *app) run(ctx context.Context) error {
 	}
 }
 
+// waitForBindSweep blocks until every listener goroutine has finished its
+// first bind attempt, the context is cancelled, or a generous deadline
+// passes (4000 staggered starts take ~4 s; the slack covers slow binds).
+func (a *app) waitForBindSweep(ctx context.Context) {
+	targets := int64(len(a.targets))
+	if targets == 0 {
+		return
+	}
+	deadline := time.After(30 * time.Second)
+	for a.stats.bindAttempts.Load() < targets {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline:
+			slogLogger.Warn("bind_sweep_timeout",
+				"attempts", a.stats.bindAttempts.Load(),
+				"targets", targets,
+			)
+			return
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
 // reportStats emits the periodic counters until ctx is cancelled. It selects
 // on ctx because Ticker.Stop() does not close the channel, so ranging over it
 // would block this goroutine forever.
+//
+// G7: this is also where throttled connections reach the security log — in
+// aggregate. The accept path only increments a counter; doing per-event log
+// I/O there let a flood stall the listener.
 func (a *app) reportStats(ctx context.Context, ticker *time.Ticker) {
+	lastThrottled := int64(0)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			conn, pay, errs, throt := a.stats.snapshot()
+			if throt > lastThrottled && a.secLog != nil {
+				a.secLog.LogThrottledBulk(int(throt - lastThrottled))
+				lastThrottled = throt
+			}
 			listening := a.pm.ListeningCount()
 			fmt.Fprintf(os.Stderr, "  [stats] listening:%d  connections:%d  payloads:%d  errors:%d  throttled:%d\n",
 				listening, conn, pay, errs, throt)
@@ -540,7 +621,7 @@ func (a *app) startListeners(ctx context.Context) *sync.WaitGroup {
 		listeners.Add(1)
 		go func() {
 			defer listeners.Done()
-			err := listenPort(ctx, p, a.cfg, a.pm, a.log, a.secLog, &a.stats, a.conns, a.hits, a.fair)
+			err := listenPort(ctx, p, a.cfg, a.pm, a.log, &a.stats, a.conns, a.hits, a.fair)
 			if err != nil && ctx.Err() == nil {
 				a.stats.errors.Add(1)
 			}
@@ -658,7 +739,6 @@ func listenPort(
 	cfg *config.Config,
 	pm *portscan.PortManager,
 	log *logger.Logger,
-	secLog *logger.SecurityLogger,
 	stats *statsCounters,
 	conns *connectionTracker,
 	hits *hitReporter,
@@ -690,6 +770,7 @@ func listenPort(
 	}
 
 	listener, err := bindListener()
+	stats.bindAttempts.Add(1) // first attempt done, whatever it returned (G9)
 	if err != nil {
 		slogLogger.Error("listener_failed",
 			"port", port,
@@ -779,11 +860,12 @@ func listenPort(
 
 		// Fairness first: one flooded port or sender must not take every
 		// slot. The reservation is released on every path, including when
-		// the global tracker rejects the connection.
+		// the global tracker rejects the connection. Rejections only bump
+		// a counter here — the security log is written in aggregate by the
+		// stats reporter, never on the accept path (G7).
 		remote := conn.RemoteAddr().String()
 		ip, _, _ := net.SplitHostPort(remote)
 		if !fair.tryAcquire(port, ip) {
-			secLog.LogThrottled(remote, port)
 			stats.throttled.Add(1)
 			conn.Close()
 			continue
@@ -798,8 +880,7 @@ func listenPort(
 			}(conn)
 		} else {
 			fair.release(port, ip)
-			// At capacity — close immediately, log throttle event
-			secLog.LogThrottled(remote, port)
+			// At capacity — close immediately; aggregate-logged (G7)
 			stats.throttled.Add(1)
 			conn.Close()
 		}

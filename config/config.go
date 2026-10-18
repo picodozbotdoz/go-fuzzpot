@@ -1,9 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -109,7 +111,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	// KnownFields: a misspelled key must fail the load, not silently fall
+	// back to its default (G11). Defaults still apply for absent keys.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -145,6 +151,11 @@ func (c *Config) Validate() error {
 	if c.Capture.MaxPayloadSize < 1 {
 		return fmt.Errorf("max_payload_size must be >= 1")
 	}
+	// G11: each captured event costs ~8x max_payload_size in flight (buffer,
+	// hex, JSON line) — a runaway value defeats the memory budget.
+	if c.Capture.MaxPayloadSize > 1<<20 {
+		return fmt.Errorf("max_payload_size must be <= %d (1 MiB)", 1<<20)
+	}
 	if c.Refresh.IntervalSec < 5 {
 		return fmt.Errorf("refresh_interval_sec must be >= 5")
 	}
@@ -156,6 +167,17 @@ func (c *Config) Validate() error {
 	}
 	if c.Logging.CompressDelaySec < 0 {
 		return fmt.Errorf("compress_delay_sec must be >= 0")
+	}
+	// G11: the sensor writes as root-adjacent service accounts; a relative
+	// dir or a file component would let a bad config point the payload log
+	// anywhere on disk. Absolute under either convention: deployments use
+	// POSIX paths even when validated on a Windows dev host.
+	if !filepath.IsAbs(c.Logging.Dir) && !strings.HasPrefix(c.Logging.Dir, "/") {
+		return fmt.Errorf("logging.dir must be an absolute path, got %q", c.Logging.Dir)
+	}
+	if c.Logging.File == "" || c.Logging.File == "." || c.Logging.File == ".." ||
+		strings.ContainsAny(c.Logging.File, `/\`) {
+		return fmt.Errorf("logging.file must be a bare file name, got %q", c.Logging.File)
 	}
 	return nil
 }

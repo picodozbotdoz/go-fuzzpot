@@ -331,6 +331,33 @@ func (l *Logger) Sync() error {
 	return l.file.Sync()
 }
 
+// Reopen closes the current descriptor and re-opens the log by path (G10).
+//
+// logrotate renames the payload file out from under the sensor; without a
+// reopen, writes keep landing on the unlinked old inode where no tailer
+// will ever find them. SIGHUP is the standard trigger. On failure the old
+// descriptor (if still open) is kept so a later retry has a chance.
+func (l *Logger) Reopen() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	f, err := os.OpenFile(l.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+	if err != nil {
+		return fmt.Errorf("reopen log %s: %w", l.logPath, err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return fmt.Errorf("stat reopened log %s: %w", l.logPath, err)
+	}
+	if l.file != nil {
+		l.file.Close()
+	}
+	l.file = f
+	l.written = info.Size()
+	return nil
+}
+
 // Close flushes and closes the log file.
 func (l *Logger) Close() error {
 	l.mu.Lock()

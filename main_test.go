@@ -69,11 +69,6 @@ func TestAcceptLoop_CtxCancelDuringIdleAccept(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer log.Close()
-	secLog, err := logger.NewSecurityLogger(tmpDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer secLog.Close()
 
 	pm := portscan.NewPortManager(nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -81,7 +76,7 @@ func TestAcceptLoop_CtxCancelDuringIdleAccept(t *testing.T) {
 	port := freeTCPPort(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- listenPort(ctx, port, cfg, pm, log, secLog, &stats, conns, newHitReporter(io.Discard), newFairnessLimiter(0, 0))
+		done <- listenPort(ctx, port, cfg, pm, log, &stats, conns, newHitReporter(io.Discard), newFairnessLimiter(0, 0))
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -1097,5 +1092,143 @@ func TestHandlerReservationScalesWithPayload(t *testing.T) {
 	large := handlerReservation(&config.Config{Capture: config.CaptureConfig{MaxPayloadSize: 65536}})
 	if large != 65536*8 {
 		t.Fatalf("64 KiB payload reservation = %d, want %d", large, 65536*8)
+	}
+}
+
+// ── G9: readiness reflects real binds, not the target list ────────────────
+
+// A port held by another process cannot be bound; when that is the ONLY
+// target, run() must fail instead of staying up and exiting 0.
+func TestAppRun_NoPortsBoundReturnsError(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.Config{Refresh: config.RefreshConfig{IntervalSec: 5}}
+	a := newTestApp(t, cfg, []int{port})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.run(ctx) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("run() succeeded with zero bound ports (G9)")
+		}
+		if !strings.Contains(err.Error(), "no ports could be bound") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not return")
+	}
+}
+
+// ── G10: SIGHUP reopens logs by path (logrotate support) ──────────────────
+
+func TestLoggerReopenAfterRotate(t *testing.T) {
+	dir := t.TempDir()
+	l, err := logger.New(dir, "reopen.log", 10, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+
+	l.WriteRaw("before-rotation")
+
+	// Simulate external rotation with the copy+truncate model: renaming a
+	// file out from under an open descriptor is POSIX behaviour; on the
+	// Windows dev host the open handle blocks os.Rename outright.
+	moved := filepath.Join(dir, "reopen.log.1")
+	if err := os.WriteFile(moved, []byte("before-rotation\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(filepath.Join(dir, "reopen.log"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.Reopen(); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	l.WriteRaw("after-rotation")
+
+	before, err := os.ReadFile(moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "reopen.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(before), "before-rotation") {
+		t.Error("rotated copy lost the pre-reopen line")
+	}
+	if !strings.Contains(string(after), "after-rotation") {
+		t.Error("post-reopen write did not land in the reopened path")
+	}
+}
+
+func TestWatchSignals_SighupReopensLogs(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+
+	sigCh := make(chan os.Signal, 1)
+	cancel := func() {}
+	stop := make(chan struct{})
+	a.watchSignals(sigCh, cancel)
+	go func() { <-stop }()
+
+	// The payload logger writes to app.log in the temp dir; rotate it away,
+	// deliver SIGHUP, and verify a new write lands at the original path.
+	os.Rename(a.log.Path(), a.log.Path()+".1")
+
+	sigCh <- syscall.SIGHUP
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(a.log.Path()); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.log.WriteRaw("post-hup")
+	data, err := os.ReadFile(a.log.Path())
+	if err != nil {
+		t.Fatalf("log was not reopened after SIGHUP: %v", err)
+	}
+	if !strings.Contains(string(data), "post-hup") {
+		t.Error("write after SIGHUP reopen did not land in the reopened file")
+	}
+	close(stop)
+}
+
+// ── G7: throttled connections are aggregated off the accept path ──────────
+
+func TestLogThrottledBulkAggregates(t *testing.T) {
+	dir := t.TempDir()
+	sl, err := logger.NewSecurityLogger(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sl.Close()
+
+	sl.LogThrottledBulk(500)
+	sl.LogThrottledBulk(0) // no-op, must not emit
+
+	data, err := os.ReadFile(filepath.Join(dir, "security.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, `"count":500`) {
+		t.Errorf("aggregate event missing count=500: %s", content)
+	}
+	if strings.Count(content, "connection_throttled") != 1 {
+		t.Errorf("want exactly one aggregated event, got: %s", content)
 	}
 }

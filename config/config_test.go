@@ -253,3 +253,51 @@ func TestRefreshInterval(t *testing.T) {
 		t.Errorf("RefreshInterval() = %v, want %v", got, want)
 	}
 }
+
+// ── G11: strict parsing and path/payload validation ────────────────────────
+
+// A misspelled key must fail the load instead of silently falling back to
+// its default.
+func TestLoadRejectsUnknownField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	if err := os.WriteFile(path, []byte("capture:\n  read_timeout_sek: 5\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a misspelled key (G11)")
+	}
+	if !strings.Contains(err.Error(), "read_timeout_sek") {
+		t.Fatalf("error should name the unknown field, got: %v", err)
+	}
+}
+
+func TestValidateRejectsOversizePayload(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Capture.MaxPayloadSize = 1<<20 + 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted max_payload_size over 1 MiB (G11)")
+	}
+	cfg.Capture.MaxPayloadSize = 1 << 20
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("1 MiB boundary must be accepted, got: %v", err)
+	}
+}
+
+func TestValidateRejectsRelativeLogDir(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Logging.Dir = "relative/logs"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted a relative logging.dir (G11)")
+	}
+}
+
+func TestValidateRejectsFileWithPathSeparators(t *testing.T) {
+	for _, name := range []string{"../escape.log", "sub/payloads.log", `sub\payloads.log`, "..", "."} {
+		cfg := DefaultConfig()
+		cfg.Logging.File = name
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("Validate accepted logging.file %q (G11)", name)
+		}
+	}
+}
