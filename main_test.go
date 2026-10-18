@@ -1232,3 +1232,34 @@ func TestLogThrottledBulkAggregates(t *testing.T) {
 		t.Errorf("want exactly one aggregated event, got: %s", content)
 	}
 }
+
+// ── R2-G3: Ctrl-C during startup is a shutdown, not a bind failure ────────
+
+func TestAppRun_EarlyCancelIsNotABindFailure(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	cfg := &config.Config{Refresh: config.RefreshConfig{IntervalSec: 5}}
+	// Many targets make the staggered startup outlast the cancel.
+	var targets []int
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	targets = append(targets, ln.Addr().(*net.TCPAddr).Port)
+
+	a := newTestApp(t, cfg, targets)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel BEFORE the bind sweep can complete
+
+	done := make(chan error, 1)
+	go func() { done <- a.run(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() reported %v for an early cancel; want nil (R2-G3)", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not return")
+	}
+}

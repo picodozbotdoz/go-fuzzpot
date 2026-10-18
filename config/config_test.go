@@ -301,3 +301,40 @@ func TestValidateRejectsFileWithPathSeparators(t *testing.T) {
 		}
 	}
 }
+
+// ── R2-G4 / R2-G10 ────────────────────────────────────────────────────────
+
+// An explicit zero used to silently disable the memory budget and fairness
+// caps, contradicting the documented "zero falls back to defaults".
+func TestLoadCoercesZeroLimitsToDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	yaml := "limits:\n  memory_budget_mb: 0\n  max_concurrent_per_port: 0\n  max_concurrent_per_ip: 0\n"
+	if err := os.WriteFile(path, []byte(yaml), 0640); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := DefaultConfig()
+	if cfg.Limits.MemoryBudgetMB != def.Limits.MemoryBudgetMB ||
+		cfg.Limits.MaxPerPort != def.Limits.MaxPerPort ||
+		cfg.Limits.MaxPerIP != def.Limits.MaxPerIP {
+		t.Fatalf("explicit zeros not coerced to defaults: %+v", cfg.Limits)
+	}
+}
+
+// An empty config file is "no config": defaults, not a parse failure.
+func TestLoadEmptyFileUsesDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	if err := os.WriteFile(path, nil, 0640); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("empty config failed to load (R2-G10): %v", err)
+	}
+	if cfg.Capture.ReadTimeoutSec != 10 {
+		t.Errorf("defaults not applied for empty config: %+v", cfg.Capture)
+	}
+}

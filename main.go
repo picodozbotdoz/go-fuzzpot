@@ -404,6 +404,9 @@ type app struct {
 	conns   *connectionTracker
 	fair    *fairnessLimiter
 	hits    *hitReporter
+	// lastThrottleFlush is the throttled count already written to the
+	// security log in aggregate (R2-G9); drain flushes the final delta.
+	lastThrottleFlush atomic.Int64
 }
 
 // newApp builds the run-time state and resolves the target port list. The
@@ -536,7 +539,17 @@ func (a *app) run(ctx context.Context) error {
 
 	bound := int64(a.pm.ListeningCount())
 	targets := int64(len(a.targets))
+	if ctx.Err() != nil {
+		// R2-G3: SIGINT during the staggered startup is a shutdown, not a
+		// bind failure — reporting "no ports could be bound" (and exiting
+		// 1) misdiagnosed a clean Ctrl-C as a port/config problem.
+		a.drain(listeners)
+		return nil
+	}
 	if bound == 0 && targets > 0 {
+		// Drain anyway: a listener that bound between the count and this
+		// check can still have an in-flight handler.
+		a.drain(listeners)
 		return fmt.Errorf("no ports could be bound (0 of %d targets)", targets)
 	}
 	if bound < targets {
@@ -611,6 +624,7 @@ func (a *app) reportStats(ctx context.Context, ticker *time.Ticker) {
 			s := a.stats.snapshot()
 			if s.throttled > lastThrottled && a.secLog != nil {
 				a.secLog.LogThrottledBulk(int(s.throttled - lastThrottled))
+				a.lastThrottleFlush.Store(s.throttled)
 				lastThrottled = s.throttled
 			}
 			listening := a.pm.ListeningCount()
@@ -675,6 +689,22 @@ func (a *app) drain(listeners *sync.WaitGroup) {
 			"grace_period_sec", int(shutdownGracePeriod.Seconds()),
 		)
 		fmt.Fprintf(os.Stderr, "  [!] shutdown timed out with %d handler(s) still running\n", n)
+	}
+
+	// R2-G9: flush the final throttled delta — the security log otherwise
+	// undercounts rejections by up to one stats interval after a flood
+	// followed by a quick shutdown.
+	if a.secLog != nil {
+		for {
+			last := a.lastThrottleFlush.Load()
+			cur := a.stats.throttled.Load()
+			if cur <= last {
+				break
+			}
+			if a.lastThrottleFlush.CompareAndSwap(last, cur) {
+				a.secLog.LogThrottledBulk(int(cur - last))
+			}
+		}
 	}
 
 	// Flush the final rotation window before the deferred Close runs.
@@ -767,6 +797,23 @@ func listenAddress(port int) string {
 	return net.JoinHostPort(listenHost, strconv.Itoa(port))
 }
 
+// watchedListener pairs a listener with the goroutine that unparks its
+// Accept on shutdown. Close releases that goroutine first, so a rebind
+// (which closes the old listener synchronously) cannot leak the watcher
+// until process exit (R2-G7).
+type watchedListener struct {
+	ln   net.Listener
+	done chan struct{}
+	once sync.Once
+}
+
+func (w *watchedListener) Accept() (net.Conn, error) { return w.ln.Accept() }
+func (w *watchedListener) Addr() net.Addr            { return w.ln.Addr() }
+func (w *watchedListener) Close() error {
+	w.once.Do(func() { close(w.done) })
+	return w.ln.Close()
+}
+
 func listenPort(
 	ctx context.Context,
 	port int,
@@ -789,18 +836,25 @@ func listenPort(
 		Control: listenControl,
 	}
 	// bindListener listens and arranges for a parked Accept to unblock
-	// when the context is cancelled (each listener gets its own watcher,
-	// so rebinds never race the watcher).
+	// when the context is cancelled or the listener is closed (each
+	// listener gets its own watcher, so rebinds never race the watcher).
+	// R2-G7: the wrapper gives the watcher a second exit — the old design
+	// parked every replaced listener's watcher on the shared ctx.Done()
+	// until process exit, leaking one goroutine per rebind.
 	bindListener := func() (net.Listener, error) {
 		l, lerr := lc.Listen(ctx, "tcp", addr)
 		if lerr != nil {
 			return nil, lerr
 		}
+		w := &watchedListener{ln: l, done: make(chan struct{})}
 		go func() {
-			<-ctx.Done()
+			select {
+			case <-ctx.Done():
+			case <-w.done:
+			}
 			l.Close()
 		}()
-		return l, nil
+		return w, nil
 	}
 
 	listener, err := bindListener()
@@ -825,6 +879,18 @@ func listenPort(
 	var acceptBackoff time.Duration
 	consecutivePermanent := 0
 
+	// backoffPause waits out the accept-error backoff while staying
+	// cancellable: a plain Sleep kept listeners parked up to 10 s into
+	// shutdown and stretched the drain grace (R2-G6).
+	backoffPause := func(d time.Duration) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(d):
+			return true
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -846,12 +912,16 @@ func listenPort(
 			if isTemporaryAcceptError(err) {
 				// Transient (timeout, fd exhaustion, aborted connection):
 				// pause briefly and retry on the same listener.
-				time.Sleep(acceptBackoff)
+				if !backoffPause(acceptBackoff) {
+					return nil
+				}
 			} else {
 				// Permanent: pause, and periodically rebind the listener
 				// in case it ended up in a broken state.
 				consecutivePermanent++
-				time.Sleep(acceptBackoff)
+				if !backoffPause(acceptBackoff) {
+					return nil
+				}
 				if consecutivePermanent >= acceptRebindThreshold {
 					stats.rebinds.Add(1)
 					slogLogger.Warn("listener_rebind",

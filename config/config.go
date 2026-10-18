@@ -2,7 +2,9 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -126,7 +128,28 @@ func Load(path string) (*Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
+		// R2-G10: an empty config file is "no config", not a parse failure
+		// — `touch config.yaml` used to abort startup with "parse config:
+		// EOF".
+		if errors.Is(err, io.EOF) {
+			return &cfg, nil
+		}
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	// R2-G4: LimitsConfig documents "zero values fall back to the
+	// defaults", but decoding an explicit 0 overwrites the seeded default
+	// — silently disabling the memory budget and the fairness caps. Coerce
+	// non-positive values back.
+	def := DefaultConfig()
+	if cfg.Limits.MemoryBudgetMB <= 0 {
+		cfg.Limits.MemoryBudgetMB = def.Limits.MemoryBudgetMB
+	}
+	if cfg.Limits.MaxPerPort <= 0 {
+		cfg.Limits.MaxPerPort = def.Limits.MaxPerPort
+	}
+	if cfg.Limits.MaxPerIP <= 0 {
+		cfg.Limits.MaxPerIP = def.Limits.MaxPerIP
 	}
 
 	return &cfg, nil

@@ -76,9 +76,13 @@ func EphemeralRange() (int, int, error) {
 }
 
 func parseNetshValue(line string) (int, error) {
+	// netsh prints "Start Port      : 49152" — the value is the LAST
+	// whitespace-separated token; fields[2] was the ":" separator, so
+	// Atoi always failed and the detection was dead code falling back to
+	// the hardcoded 49152-65535 (R2-G5).
 	fields := strings.Fields(line)
-	if len(fields) >= 3 {
-		return strconv.Atoi(fields[2])
+	if len(fields) == 0 {
+		return 0, strconv.ErrSyntax
 	}
-	return 0, strconv.ErrSyntax
+	return strconv.Atoi(fields[len(fields)-1])
 }

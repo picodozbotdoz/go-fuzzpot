@@ -17,8 +17,12 @@ func init() {
 func getUsedPortsFreeBSD() map[int]bool {
 	used := make(map[int]bool)
 
-	// Try sockstat first (faster, FreeBSD-specific)
-	if data, err := exec.Command("sockstat", "-4l", "-p", "tcp").Output(); err == nil {
+	// sockstat's -p takes PORT NUMBERS, not a protocol name, so the first
+	// probe always failed and the `-l` fallback ran — which includes UDP
+	// listeners and therefore over-excludes ports from the target set
+	// (R2-G5, conservative direction). Keep the fallback for robustness;
+	// sockstat itself filters listening sockets only.
+	if data, err := exec.Command("sockstat", "-4l", "-6l").Output(); err == nil {
 		parseSockstat(data, used)
 	} else if data, err := exec.Command("sockstat", "-l").Output(); err == nil {
 		parseSockstat(data, used)

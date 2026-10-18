@@ -90,36 +90,33 @@ func NewWithOptions(dir, filename string, rotSizeMB int, maxFiles int, opts Opti
 	}, nil
 }
 
-// writeLine appends one complete line, tolerating short writes (G8).
+// writeLine appends one complete line, recovering from torn writes (G8, R2-G1).
 //
-// A short write leaves a torn half-line that the next append would
-// concatenate onto, silently corrupting two records. The pre-write offset
-// is l.written (every write goes through here, in O_APPEND mode), so the
-// recovery is to truncate back to it and retry once.
+// os.File.Write returns a non-nil error whenever n != len(line), so the
+// realistic torn case is n > 0 with an error (ENOSPC/EIO mid-line). The
+// pre-write offset is l.written (every write goes through here, in O_APPEND
+// mode), so recovery truncates the partial tail back to a line boundary —
+// otherwise the next append concatenates onto the half-line and corrupts
+// two records.
 func (l *Logger) writeLine(line []byte) error {
 	if l.file == nil {
 		return ErrLoggerClosed
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		n, err := l.file.Write(line)
-		l.written += int64(n)
-		if err == nil && n == len(line) {
-			if l.opts.FsyncWrites {
-				return l.file.Sync()
-			}
-			return nil
+	n, err := l.file.Write(line)
+	l.written += int64(n)
+	if err == nil && n == len(line) {
+		if l.opts.FsyncWrites {
+			return l.file.Sync()
 		}
-		if err == nil && n < len(line) {
-			// Short write with no error: cut the torn tail and retry.
-			if terr := l.file.Truncate(l.written - int64(n)); terr != nil {
-				return fmt.Errorf("short write recovery (wrote %d/%d): %w", n, len(line), terr)
-			}
-			l.written -= int64(n)
-			continue
-		}
-		return err
+		return nil
 	}
-	return fmt.Errorf("short write persisted after retry: %d/%d bytes", len(line), len(line))
+	if n > 0 {
+		if terr := l.file.Truncate(l.written - int64(n)); terr != nil {
+			return fmt.Errorf("torn write recovery (wrote %d/%d): %w", n, len(line), terr)
+		}
+		l.written -= int64(n)
+	}
+	return err
 }
 
 // WriteEventTyped appends a JSON-line event to the log file using a typed struct.
@@ -129,11 +126,11 @@ func (l *Logger) WriteEventTyped(event interface{}) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.rotSize > 0 && l.written >= l.rotSize {
-		if err := l.rotate(); err != nil {
-			return err
-		}
-	}
+	// R2-G2: a failed rotation must not drop the event. If the rollback
+	// kept a usable descriptor the write proceeds (over-size until the
+	// next event retries rotation); if rotation left the logger closed,
+	// writeLine reports ErrLoggerClosed.
+	l.maybeRotate()
 
 	line, err := json.Marshal(event)
 	if err != nil {
@@ -149,13 +146,19 @@ func (l *Logger) WriteRaw(line string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.rotSize > 0 && l.written >= l.rotSize {
-		if err := l.rotate(); err != nil {
-			return err
-		}
-	}
+	l.maybeRotate() // R2-G2: see WriteEventTyped
 
 	return l.writeLine([]byte(line + "\n"))
+}
+
+// maybeRotate rotates when the size threshold is reached. Failures are
+// swallowed on purpose: the write paths must still attempt their write —
+// dropping the event because rotation failed is the one unrecoverable
+// outcome (R2-G2). The closed-logger case surfaces via writeLine.
+func (l *Logger) maybeRotate() {
+	if l.rotSize > 0 && l.written >= l.rotSize {
+		_ = l.rotate()
+	}
 }
 
 // Rotations reports how many rotations this logger has performed (G12).
@@ -205,8 +208,14 @@ func (l *Logger) rotate() error {
 			os.Rename(oldPath, l.logPath) // roll back a partial copy
 			if f, rerr := os.OpenFile(l.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640); rerr == nil {
 				l.file = f
+				return fmt.Errorf("rotate: %w (copy fallback: %v)", err, cerr)
 			}
-			return fmt.Errorf("rotate: %w (copy fallback: %v)", err, cerr)
+			// R2-G2: both the rename and the rollback reopen failed while
+			// the descriptor is already closed. Park in the closed state
+			// (writes return ErrLoggerClosed) instead of keeping a dead
+			// *os.File that fails with "file already closed" forever.
+			l.file = nil
+			return fmt.Errorf("rotate: %w (copy fallback: %v, rollback reopen failed)", err, cerr)
 		}
 	}
 
@@ -330,20 +339,32 @@ func (l *Logger) pruneOldLogs() {
 		return
 	}
 
-	// Sort by modification time (oldest first)
-	sort.Slice(validMatches, func(i, j int) bool {
-		fi, _ := os.Stat(validMatches[i])
-		fj, _ := os.Stat(validMatches[j])
-		if fi == nil || fj == nil {
-			return false
+	// Sort by modification time (oldest first). R2-G8: files can vanish
+	// between Glob and Stat (async compression removes plain originals),
+	// and a comparator returning false regardless of order violates the
+	// sort contract — the "oldest" head could then contain a newer file
+	// and retention data beyond policy is lost. Stat once up front and
+	// drop the misses instead.
+	type rotFile struct {
+		path    string
+		modTime time.Time
+	}
+	statted := make([]rotFile, 0, len(validMatches))
+	for _, m := range validMatches {
+		if fi, err := os.Stat(m); err == nil {
+			statted = append(statted, rotFile{m, fi.ModTime()})
 		}
-		return fi.ModTime().Before(fj.ModTime())
+	}
+	sort.Slice(statted, func(i, j int) bool {
+		return statted[i].modTime.Before(statted[j].modTime)
 	})
 
 	// Remove oldest files to get back under the cap
-	toRemove := len(validMatches) - l.maxFiles
-	for i := 0; i < toRemove; i++ {
-		os.Remove(validMatches[i])
+	if len(statted) <= l.maxFiles {
+		return
+	}
+	for _, f := range statted[:len(statted)-l.maxFiles] {
+		os.Remove(f.path)
 	}
 }
 
