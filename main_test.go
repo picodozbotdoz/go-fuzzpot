@@ -693,7 +693,7 @@ func TestNewApp_ResolvesSortedTargetsAndExcludes(t *testing.T) {
 		Exclude: []int{2002},
 	}}
 
-	a, targets := newApp(cfg, nil, nil, portRanges(cfg))
+	a, targets := newApp(cfg, portRanges(cfg))
 
 	if a.conns == nil {
 		t.Fatal("newApp did not build a connection tracker")
@@ -725,19 +725,36 @@ func TestAppRun_ReturnsAfterCancel(t *testing.T) {
 	a := newTestApp(t, cfg, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	errCh := make(chan error, 1)
 	go func() {
-		a.run(ctx)
-		close(done)
+		errCh <- a.run(ctx)
 	}()
 
 	time.Sleep(30 * time.Millisecond)
 	cancel()
 
 	select {
-	case <-done:
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("run() returned %v, want nil", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("run() did not return after ctx cancel")
+	}
+}
+
+// newApp leaves the loggers unattached so --dry-run can exit before opening
+// any file. run() must reject that state instead of panicking inside a handler.
+func TestAppRun_RejectsMissingLoggers(t *testing.T) {
+	cfg := &config.Config{Refresh: config.RefreshConfig{IntervalSec: 5}}
+	a, _ := newApp(cfg, nil)
+
+	err := a.run(context.Background())
+	if err == nil {
+		t.Fatal("run() accepted an app with no loggers")
+	}
+	if !strings.Contains(err.Error(), "loggers must be attached") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

@@ -249,6 +249,37 @@ func realMain() int {
 		AddSource: false,
 	}))
 
+	slogLogger.Info("fuzzpot_starting",
+		"version", version,
+		"config_path", *cfgPath,
+		"log_dir", cfg.Logging.Dir,
+		"read_timeout_sec", cfg.Capture.ReadTimeoutSec,
+		"refresh_interval_sec", cfg.Refresh.IntervalSec,
+	)
+
+	ranges := portRanges(cfg)
+	a, targets := newApp(cfg, ranges)
+
+	printBanner()
+	showConflictAnalysis(a.pm, ranges, cfg)
+
+	fmt.Fprintf(os.Stderr, "  [*] Ports in scope:   %d ports\n", len(targets))
+	if len(targets) > 0 {
+		fmt.Fprintf(os.Stderr, "  [*] Range:            %d – %d\n", targets[0], targets[len(targets)-1])
+	}
+	fmt.Fprintf(os.Stderr, "  [*] Log file:         %s\n", cfg.LogPath())
+	fmt.Fprintf(os.Stderr, "  [*] Read timeout:     %ds\n", cfg.Capture.ReadTimeoutSec)
+	fmt.Fprintf(os.Stderr, "  [*] Refresh interval: %ds\n", cfg.Refresh.IntervalSec)
+
+	if *dryRun {
+		fmt.Fprintln(os.Stderr)
+		showPortSummary(targets)
+		return 0
+	}
+
+	// Loggers are opened only for a real run. --dry-run must not touch the
+	// filesystem: creating the log directory needs root on a Linux deployment,
+	// so a non-root operator could not even inspect the port list.
 	// File logger (configurable: rotate_mb, keep_files, compression, fsync).
 	log, err := logger.NewWithOptions(cfg.Logging.Dir, cfg.Logging.File,
 		cfg.Logging.RotateMB, cfg.Logging.KeepFiles, logger.Options{
@@ -270,33 +301,8 @@ func realMain() int {
 	}
 	defer secLog.Close()
 
-	slogLogger.Info("fuzzpot_starting",
-		"version", version,
-		"config_path", *cfgPath,
-		"log_dir", cfg.Logging.Dir,
-		"read_timeout_sec", cfg.Capture.ReadTimeoutSec,
-		"refresh_interval_sec", cfg.Refresh.IntervalSec,
-	)
-
-	ranges := portRanges(cfg)
-	a, targets := newApp(cfg, log, secLog, ranges)
-
-	printBanner()
-	showConflictAnalysis(a.pm, ranges, cfg)
-
-	fmt.Fprintf(os.Stderr, "  [*] Ports in scope:   %d ports\n", len(targets))
-	if len(targets) > 0 {
-		fmt.Fprintf(os.Stderr, "  [*] Range:            %d – %d\n", targets[0], targets[len(targets)-1])
-	}
-	fmt.Fprintf(os.Stderr, "  [*] Log file:         %s\n", cfg.LogPath())
-	fmt.Fprintf(os.Stderr, "  [*] Read timeout:     %ds\n", cfg.Capture.ReadTimeoutSec)
-	fmt.Fprintf(os.Stderr, "  [*] Refresh interval: %ds\n", cfg.Refresh.IntervalSec)
-
-	if *dryRun {
-		fmt.Fprintln(os.Stderr)
-		showPortSummary(targets)
-		return 0
-	}
+	a.log = log
+	a.secLog = secLog
 
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "  [*] Starting listeners...")
@@ -307,7 +313,10 @@ func realMain() int {
 	stopSignals := a.handleSignals(cancel)
 	defer stopSignals()
 
-	a.run(ctx)
+	if err := a.run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "  [!] %v\n", err)
+		return 1
+	}
 	return 0
 }
 
@@ -325,17 +334,16 @@ type app struct {
 	hits    *hitReporter
 }
 
-// newApp builds the run-time state and resolves the target port list.
-func newApp(cfg *config.Config, log *logger.Logger, secLog *logger.SecurityLogger,
-	ranges [][2]int) (*app, []int) {
+// newApp builds the run-time state and resolves the target port list. The
+// loggers are attached later, once a real run has been decided: --dry-run must
+// not open log files.
+func newApp(cfg *config.Config, ranges [][2]int) (*app, []int) {
 	pm := portscan.NewPortManager(cfg.Ports.Exclude)
 	targets := pm.TargetPorts(ranges)
 	sort.Ints(targets)
 
 	return &app{
 		cfg:     cfg,
-		log:     log,
-		secLog:  secLog,
 		pm:      pm,
 		targets: targets,
 		// Connection limiter — prevents goroutine explosion under flood.
@@ -393,7 +401,14 @@ func (a *app) watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 
 // run starts the stats reporter and the listeners, then supervises them until
 // ctx is cancelled, at which point it drains and returns.
-func (a *app) run(ctx context.Context) {
+func (a *app) run(ctx context.Context) error {
+	// newApp deliberately leaves the loggers unattached so that --dry-run can
+	// exit before any file is opened. Failing here turns a nil-pointer panic
+	// inside a handler into one clear error at the only place that can cause it.
+	if a.log == nil || a.secLog == nil {
+		return errors.New("app: loggers must be attached before run")
+	}
+
 	statsWriter := time.NewTicker(10 * time.Second)
 	defer statsWriter.Stop()
 	go a.reportStats(ctx, statsWriter)
@@ -416,7 +431,7 @@ func (a *app) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			a.drain(listeners)
-			return
+			return nil
 		case <-ticker.C:
 			a.checkConflicts()
 		}
