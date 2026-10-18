@@ -317,6 +317,20 @@ func (l *Logger) pruneOldLogs() {
 	}
 }
 
+// Sync flushes the log file to stable storage.
+//
+// Close alone does not guarantee the last rotation window is durable, so a
+// clean shutdown should Sync before Close. Safe on a logger that was never
+// written to.
+func (l *Logger) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
+	return l.file.Sync()
+}
+
 // Close flushes and closes the log file.
 func (l *Logger) Close() error {
 	l.mu.Lock()

@@ -530,3 +530,29 @@ func TestFsyncWritesOption(t *testing.T) {
 		t.Errorf("content = %q", string(data))
 	}
 }
+
+func TestSync_FlushesPendingWrite(t *testing.T) {
+	tmpDir := t.TempDir()
+	log, err := New(tmpDir, "sync.log", 10, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := log.WriteRaw("before-sync"); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Sync(); err != nil {
+		t.Fatalf("Sync() = %v, want nil", err)
+	}
+	// The line must already be on disk while the file is still open.
+	data, err := os.ReadFile(log.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "before-sync\n" {
+		t.Fatalf("content after Sync = %q", string(data))
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

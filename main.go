@@ -490,6 +490,14 @@ func (a *app) startListeners(ctx context.Context) *sync.WaitGroup {
 // Anything still running after the grace period is reported rather than waited
 // on indefinitely: a hung handler must not block shutdown forever.
 func (a *app) drain(listeners *sync.WaitGroup) {
+	// Stop accepting before waiting on handlers. The reverse order races: a
+	// connection accepted after the handler counter reached zero would
+	// Add(1) to a completed WaitGroup (forbidden) and could enter
+	// WriteEventTyped after Close.
+	if !waitOrTimeout(listeners, shutdownGracePeriod) {
+		slogLogger.Warn("shutdown_timeout", "component", "listeners")
+	}
+
 	if n := a.conns.wait(shutdownGracePeriod); n > 0 {
 		slogLogger.Warn("shutdown_timeout",
 			"in_flight_handlers", n,
@@ -497,8 +505,10 @@ func (a *app) drain(listeners *sync.WaitGroup) {
 		)
 		fmt.Fprintf(os.Stderr, "  [!] shutdown timed out with %d handler(s) still running\n", n)
 	}
-	if !waitOrTimeout(listeners, shutdownGracePeriod) {
-		slogLogger.Warn("shutdown_timeout", "component", "listeners")
+
+	// Flush the final rotation window before the deferred Close runs.
+	if err := a.log.Sync(); err != nil {
+		slogLogger.Warn("log_sync_failed", "error", err.Error())
 	}
 
 	conn, pay, errs, throt := a.stats.snapshot()

@@ -978,3 +978,22 @@ func TestHitReporter_ReportsSuppressedOnNextWindow(t *testing.T) {
 		t.Fatalf("first hit of the new window was not printed: %q", out)
 	}
 }
+
+// drain() must also wait for listeners to stop accepting before it returns.
+func TestAppDrain_WaitsForListeners(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+
+	var listeners sync.WaitGroup
+	listeners.Add(1)
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		listeners.Done()
+	}()
+
+	start := time.Now()
+	a.drain(&listeners)
+	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
+		t.Fatalf("drain() returned in %v; it did not wait for listeners", elapsed)
+	}
+}
