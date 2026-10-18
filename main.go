@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -142,7 +143,80 @@ func (t *connectionTracker) wait(timeout time.Duration) int {
 	return len(t.sem)
 }
 
+const (
+	// hitConsoleBurst is how many "[hit]" lines may reach the console per
+	// window. A human cannot read more than this, and an unbounded write per
+	// payload serialises every handler on os.Stderr's lock — under a flood
+	// that becomes the throughput ceiling, so an attacker could slow the
+	// honeypot simply by sending more packets.
+	hitConsoleBurst  = 20
+	hitConsoleWindow = time.Second
+)
+
+// hitReporter rate-limits console hit output without dropping the signal
+// entirely: suppressed events are counted and reported when the window rolls
+// over, so an operator can still tell that traffic is arriving.
+type hitReporter struct {
+	mu         sync.Mutex
+	out        io.Writer
+	now        func() time.Time
+	windowEnd  time.Time
+	emitted    int
+	suppressed int
+}
+
+func newHitReporter(out io.Writer) *hitReporter {
+	return &hitReporter{out: out, now: time.Now}
+}
+
+// report writes one hit line if the budget allows, otherwise counts it as
+// suppressed. The write happens outside the lock: the point is to bound the
+// number of contended writes, not to serialise them more tightly.
+func (r *hitReporter) report(srcIP string, srcPort, dstPort, size int, printable string) {
+	now := r.now()
+
+	r.mu.Lock()
+	rolled := now.After(r.windowEnd)
+	suppressed := 0
+	if rolled {
+		suppressed = r.suppressed
+		r.windowEnd = now.Add(hitConsoleWindow)
+		r.emitted = 0
+		r.suppressed = 0
+	}
+	// The report that opens a window consumes budget like any other, so a
+	// window emits exactly hitConsoleBurst lines, not one more.
+	allow := r.emitted < hitConsoleBurst
+	if allow {
+		r.emitted++
+	} else {
+		r.suppressed++
+	}
+	r.mu.Unlock()
+
+	if rolled && suppressed > 0 {
+		fmt.Fprintf(r.out, "  [hit] ... %d more hit(s) suppressed in the previous %s\n",
+			suppressed, hitConsoleWindow)
+	}
+	if !allow {
+		return
+	}
+
+	fmt.Fprintf(r.out, "  [hit] %s:%d → :%d  %d bytes  %q\n",
+		srcIP, srcPort, dstPort, size, truncate(printable, 80))
+}
+
+// main exists only so that realMain's deferred cleanup runs. os.Exit
+// terminates the process immediately, so a defer registered after it would be
+// silently skipped — which is what happened on --dry-run, where the log file
+// was opened and never closed.
 func main() {
+	os.Exit(realMain())
+}
+
+// realMain parses flags, wires dependencies and runs the service. It returns a
+// process exit code instead of calling os.Exit, so every deferred Close runs.
+func realMain() int {
 	cfgPath := flag.String("config", "config/config.yaml", "path to config file")
 	dryRun := flag.Bool("dry-run", false, "show target ports and exit without listening")
 	strict := flag.Bool("strict", false, "fail instead of falling back to built-in defaults when the config file is missing")
@@ -153,30 +227,29 @@ func main() {
 	if !config.Exists(*cfgPath) {
 		if *strict {
 			fmt.Fprintf(os.Stderr, "config error: %s not found (strict mode: refusing to fall back to defaults)\n", *cfgPath)
-			os.Exit(1)
+			return 1
 		}
 		fmt.Fprintf(os.Stderr, "  [!] WARNING: config file %s not found — falling back to built-in defaults\n", *cfgPath)
 		fmt.Fprintf(os.Stderr, "  [!] WARNING: defaults bind ~4000 ports (ranges 2000-5000 and 8000-9000); use --strict to make a missing config fatal\n")
 	}
 
-	// Load config
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "config validation: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
-	// Initialize structured logger for operational events
+	// Structured logger for operational events.
 	slogLogger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level:     slog.LevelInfo,
 		AddSource: false,
 	}))
 
-	// Setup file logger (configurable: rotate_mb, keep_files, compression, fsync)
+	// File logger (configurable: rotate_mb, keep_files, compression, fsync).
 	log, err := logger.NewWithOptions(cfg.Logging.Dir, cfg.Logging.File,
 		cfg.Logging.RotateMB, cfg.Logging.KeepFiles, logger.Options{
 			Compress:         cfg.Logging.Compress,
@@ -185,19 +258,18 @@ func main() {
 		})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logger init: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer log.Close()
 
-	// Setup security logger for incident response
+	// Security logger for incident response.
 	secLog, err := logger.NewSecurityLogger(cfg.Logging.Dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "security logger init: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer secLog.Close()
 
-	// Log startup with structured fields
 	slogLogger.Info("fuzzpot_starting",
 		"version", version,
 		"config_path", *cfgPath,
@@ -206,34 +278,11 @@ func main() {
 		"refresh_interval_sec", cfg.Refresh.IntervalSec,
 	)
 
-	// Build port ranges from config
-	var ranges [][2]int
-	for _, r := range cfg.Ports.Ranges {
-		ranges = append(ranges, [2]int{r.From, r.To})
-	}
+	ranges := portRanges(cfg)
+	a, targets := newApp(cfg, log, secLog, ranges)
 
-	pm := portscan.NewPortManager(cfg.Ports.Exclude)
-
-	// Show banner
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintf(os.Stderr, "  ██▀███   ██▀███   ▒█████   ███▄    █  ▒█████  \n")
-	fmt.Fprintf(os.Stderr, " ▓██ ▒ ██▒▓██ ▒ ██▒▒██▒  ██▒ ██ ▀█   █ ▒██▒  ██▒\n")
-	fmt.Fprintf(os.Stderr, " ▓██ ░▄█ ▒▓██ ░▄█ ▒▒██░  ██▒▓██  ▀█ ██▒▒██░  ██▒\n")
-	fmt.Fprintf(os.Stderr, " ▒██▀▀█▄  ▒██▀▀█▄  ▒██   ██ ░▓██▒  ▐▌██▒▒██   ██░\n")
-	fmt.Fprintf(os.Stderr, " ░██▓ ▒██▒░██▓ ▒██▒░ ████▓▒░░▒██░   ▓██░░ ████▓▒░\n")
-	fmt.Fprintf(os.Stderr, " ░ ▒▓ ░▒▓░░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░   ▒ ▒ ░ ▒░▒░▒░ \n")
-	fmt.Fprintf(os.Stderr, "   ░▒ ░ ▒░  ░▒ ░ ▒░  ░ ▒ ▒░   ░ ░░ ░ ░ ▒   ░ ▒ ▒░ \n")
-	fmt.Fprintf(os.Stderr, "   ░░   ░   ░░   ░ ░ ░ ░ ▒     ░░   ░  ░   ░ ░ ▒  \n")
-	fmt.Fprintf(os.Stderr, "    ░        ░           ░ ░      ░          ░  ░  \n")
-	fmt.Fprintf(os.Stderr, "                  Protocol Fuzzing Honeypot          \n")
-	fmt.Fprintf(os.Stderr, "                         v%s                      \n\n", version)
-
-	// Show conflict analysis
-	showConflictAnalysis(pm, ranges, cfg)
-
-	// Get target ports
-	targets := pm.TargetPorts(ranges)
-	sort.Ints(targets)
+	printBanner()
+	showConflictAnalysis(a.pm, ranges, cfg)
 
 	fmt.Fprintf(os.Stderr, "  [*] Ports in scope:   %d ports\n", len(targets))
 	if len(targets) > 0 {
@@ -246,52 +295,85 @@ func main() {
 	if *dryRun {
 		fmt.Fprintln(os.Stderr)
 		showPortSummary(targets)
-		os.Exit(0)
+		return 0
 	}
 
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "  [*] Starting listeners...")
 
-	// Context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Connection limiter — prevent goroutine explosion under flood.
-	// Dynamically set maxConcurrent based on system file descriptor limit
-	// to prevent DoS from exhausting all available FDs.
-	conns := newConnectionTracker(maxConnections())
-	// Stats
-	var stats statsCounters
-	statsWriter := time.NewTicker(10 * time.Second)
-	defer statsWriter.Stop()
-	go func() {
-		// Select on ctx: Ticker.Stop() does not close the channel, so a bare
-		// `for range` would block this goroutine forever at shutdown.
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-statsWriter.C:
-				conn, pay, errs, throt := stats.snapshot()
-				listening := pm.ListeningCount()
-				fmt.Fprintf(os.Stderr, "  [stats] listening:%d  connections:%d  payloads:%d  errors:%d  throttled:%d\n",
-					listening, conn, pay, errs, throt)
-				slogLogger.Info("stats_tick",
-					"listening_ports", listening,
-					"connections_total", conn,
-					"payloads_captured", pay,
-					"errors_total", errs,
-					"connections_throttled", throt,
-				)
-			}
-		}
-	}()
+	stopSignals := a.handleSignals(cancel)
+	defer stopSignals()
 
-	// Graceful shutdown on SIGINT/SIGTERM, health-check on SIGUSR1
-	// (Unix only — no user-defined signals on Windows)
+	a.run(ctx)
+	return 0
+}
+
+// app holds everything one run needs. Keeping it in a struct is what lets a
+// test drive the supervision loop without parsing flags or owning process-wide
+// signal state.
+type app struct {
+	cfg     *config.Config
+	log     *logger.Logger
+	secLog  *logger.SecurityLogger
+	pm      *portscan.PortManager
+	targets []int
+	stats   statsCounters
+	conns   *connectionTracker
+	hits    *hitReporter
+}
+
+// newApp builds the run-time state and resolves the target port list.
+func newApp(cfg *config.Config, log *logger.Logger, secLog *logger.SecurityLogger,
+	ranges [][2]int) (*app, []int) {
+	pm := portscan.NewPortManager(cfg.Ports.Exclude)
+	targets := pm.TargetPorts(ranges)
+	sort.Ints(targets)
+
+	return &app{
+		cfg:     cfg,
+		log:     log,
+		secLog:  secLog,
+		pm:      pm,
+		targets: targets,
+		// Connection limiter — prevents goroutine explosion under flood.
+		// Sized from the fd limit so a DoS cannot exhaust every descriptor.
+		conns: newConnectionTracker(maxConnections()),
+		hits:  newHitReporter(os.Stderr),
+	}, targets
+}
+
+// portRanges flattens the configured port ranges into pairs.
+func portRanges(cfg *config.Config) [][2]int {
+	ranges := make([][2]int, 0, len(cfg.Ports.Ranges))
+	for _, r := range cfg.Ports.Ranges {
+		ranges = append(ranges, [2]int{r.From, r.To})
+	}
+	return ranges
+}
+
+// handleSignals wires SIGINT/SIGTERM to cancel and the platform health signal
+// (SIGUSR1 on Unix, nothing on Windows) to an on-demand stats dump. The
+// returned function detaches the watcher.
+func (a *app) handleSignals(cancel context.CancelFunc) func() {
 	sigCh := make(chan os.Signal, 1)
 	notifySignals := append([]os.Signal{syscall.SIGINT, syscall.SIGTERM}, healthSignals()...)
 	signal.Notify(sigCh, notifySignals...)
+
+	a.watchSignals(sigCh, cancel)
+
+	return func() {
+		signal.Stop(sigCh)
+		close(sigCh)
+	}
+}
+
+// watchSignals translates received signals into actions until the channel is
+// closed. Split out from handleSignals so the behaviour can be tested with a
+// synthetic channel — process-wide signal delivery is not portable.
+func (a *app) watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 	go func() {
 		for sig := range sigCh {
 			switch sig {
@@ -301,18 +383,77 @@ func main() {
 				return
 			default:
 				// health-check signal (the only other registered kind)
-				conn, pay, errs, throt := stats.snapshot()
+				conn, pay, errs, throt := a.stats.snapshot()
 				fmt.Fprintf(os.Stderr, "  [health] listening=%d connections=%d payloads=%d errors=%d throttled=%d\n",
-					pm.ListeningCount(), conn, pay, errs, throt)
+					a.pm.ListeningCount(), conn, pay, errs, throt)
 			}
 		}
 	}()
+}
 
-	// Start listeners. Tracked separately from connections: a listener can
-	// still write to the security log (throttle events) after the main loop
-	// has decided to shut down, so shutdown must wait for these too.
+// run starts the stats reporter and the listeners, then supervises them until
+// ctx is cancelled, at which point it drains and returns.
+func (a *app) run(ctx context.Context) {
+	statsWriter := time.NewTicker(10 * time.Second)
+	defer statsWriter.Stop()
+	go a.reportStats(ctx, statsWriter)
+
+	listeners := a.startListeners(ctx)
+
+	fmt.Fprintf(os.Stderr, "  [*] Ready. Listening on %d ports.\n\n", len(a.targets))
+
+	// Validate() already rejects interval_sec < 5 for loaded configs, but run()
+	// is also reachable from tests and future embedders, and time.NewTicker
+	// panics on a non-positive duration.
+	refresh := a.cfg.RefreshInterval()
+	if refresh <= 0 {
+		refresh = 5 * time.Second
+	}
+	ticker := time.NewTicker(refresh)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			a.drain(listeners)
+			return
+		case <-ticker.C:
+			a.checkConflicts()
+		}
+	}
+}
+
+// reportStats emits the periodic counters until ctx is cancelled. It selects
+// on ctx because Ticker.Stop() does not close the channel, so ranging over it
+// would block this goroutine forever.
+func (a *app) reportStats(ctx context.Context, ticker *time.Ticker) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			conn, pay, errs, throt := a.stats.snapshot()
+			listening := a.pm.ListeningCount()
+			fmt.Fprintf(os.Stderr, "  [stats] listening:%d  connections:%d  payloads:%d  errors:%d  throttled:%d\n",
+				listening, conn, pay, errs, throt)
+			slogLogger.Info("stats_tick",
+				"listening_ports", listening,
+				"connections_total", conn,
+				"payloads_captured", pay,
+				"errors_total", errs,
+				"connections_throttled", throt,
+			)
+		}
+	}
+}
+
+// startListeners launches one goroutine per target port and returns the group.
+// Listeners are tracked separately from connections because a listener can
+// still write a throttle event to the security log after the main loop has
+// decided to shut down.
+func (a *app) startListeners(ctx context.Context) *sync.WaitGroup {
 	var listeners sync.WaitGroup
-	for _, port := range targets {
+	for _, port := range a.targets {
 		p := port
 		if ctx.Err() != nil {
 			break
@@ -320,66 +461,75 @@ func main() {
 		listeners.Add(1)
 		go func() {
 			defer listeners.Done()
-			err := listenPort(ctx, p, cfg, pm, log, secLog, &stats, conns)
+			err := listenPort(ctx, p, a.cfg, a.pm, a.log, a.secLog, &a.stats, a.conns, a.hits)
 			if err != nil && ctx.Err() == nil {
-				stats.errors.Add(1)
+				a.stats.errors.Add(1)
 			}
 		}()
 		time.Sleep(time.Millisecond) // stagger goroutine starts
 	}
+	return &listeners
+}
 
-	fmt.Fprintf(os.Stderr, "  [*] Ready. Listening on %d ports.\n\n", len(targets))
-
-	// Periodic conflict re-check
-	ticker := time.NewTicker(cfg.RefreshInterval())
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			// Drain in-flight handlers before returning: the deferred
-			// log.Close/secLog.Close calls run after this, and a handler still
-			// inside WriteEventTyped would then write to a closed file and lose
-			// the payload it had just captured.
-			if n := conns.wait(shutdownGracePeriod); n > 0 {
-				slogLogger.Warn("shutdown_timeout",
-					"in_flight_handlers", n,
-					"grace_period_sec", int(shutdownGracePeriod.Seconds()),
-				)
-				fmt.Fprintf(os.Stderr, "  [!] shutdown timed out with %d handler(s) still running\n", n)
-			}
-			// Listeners exit on ctx cancel, but may still be finishing a
-			// throttle-log write; give them the same bounded grace period.
-			if !waitOrTimeout(&listeners, shutdownGracePeriod) {
-				slogLogger.Warn("shutdown_timeout", "component", "listeners")
-			}
-			conn, pay, errs, throt := stats.snapshot()
-			fmt.Fprintf(os.Stderr, "  [*] Final: connections=%d payloads=%d errors=%d throttled=%d\n",
-				conn, pay, errs, throt)
-			slogLogger.Info("fuzzpot_shutdown",
-				"connections_total", conn,
-				"payloads_captured", pay,
-				"errors_total", errs,
-				"connections_throttled", throt,
-			)
-			fmt.Fprintln(os.Stderr, "  [*] Done.")
-			return
-		case <-ticker.C:
-			conflicts := pm.DetectConflicts()
-			if len(conflicts) > 0 {
-				secLog.LogConflict(conflicts)
-				fmt.Fprintf(os.Stderr, "  [!] %d port conflicts detected (claimed by system): %v\n",
-					len(conflicts), conflicts)
-				slogLogger.Warn("port_conflicts_detected",
-					"conflict_count", len(conflicts),
-					"conflict_ports", conflicts,
-				)
-				// Note: closed listeners auto-recover on next restart.
-				// For runtime recovery, we'd need a listener registry —
-				// kept simple here since conflicts are rare.
-			}
-		}
+// drain waits for in-flight work before the caller closes the log files.
+// Anything still running after the grace period is reported rather than waited
+// on indefinitely: a hung handler must not block shutdown forever.
+func (a *app) drain(listeners *sync.WaitGroup) {
+	if n := a.conns.wait(shutdownGracePeriod); n > 0 {
+		slogLogger.Warn("shutdown_timeout",
+			"in_flight_handlers", n,
+			"grace_period_sec", int(shutdownGracePeriod.Seconds()),
+		)
+		fmt.Fprintf(os.Stderr, "  [!] shutdown timed out with %d handler(s) still running\n", n)
 	}
+	if !waitOrTimeout(listeners, shutdownGracePeriod) {
+		slogLogger.Warn("shutdown_timeout", "component", "listeners")
+	}
+
+	conn, pay, errs, throt := a.stats.snapshot()
+	fmt.Fprintf(os.Stderr, "  [*] Final: connections=%d payloads=%d errors=%d throttled=%d\n",
+		conn, pay, errs, throt)
+	slogLogger.Info("fuzzpot_shutdown",
+		"connections_total", conn,
+		"payloads_captured", pay,
+		"errors_total", errs,
+		"connections_throttled", throt,
+	)
+	fmt.Fprintln(os.Stderr, "  [*] Done.")
+}
+
+// checkConflicts re-scans for ports claimed by the system since startup.
+func (a *app) checkConflicts() {
+	conflicts := a.pm.DetectConflicts()
+	if len(conflicts) == 0 {
+		return
+	}
+	a.secLog.LogConflict(conflicts)
+	fmt.Fprintf(os.Stderr, "  [!] %d port conflicts detected (claimed by system): %v\n",
+		len(conflicts), conflicts)
+	slogLogger.Warn("port_conflicts_detected",
+		"conflict_count", len(conflicts),
+		"conflict_ports", conflicts,
+	)
+	// Note: closed listeners auto-recover on next restart. For runtime
+	// recovery we would need a listener registry — kept simple because
+	// conflicts are rare.
+}
+
+// printBanner writes the startup banner.
+func printBanner() {
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "  ██▀███   ██▀███   ▒█████   ███▄    █  ▒█████  \n")
+	fmt.Fprintf(os.Stderr, " ▓██ ▒ ██▒▓██ ▒ ██▒▒██▒  ██▒ ██ ▀█   █ ▒██▒  ██▒\n")
+	fmt.Fprintf(os.Stderr, " ▓██ ░▄█ ▒▓██ ░▄█ ▒▒██░  ██▒▓██  ▀█ ██▒▒██░  ██▒\n")
+	fmt.Fprintf(os.Stderr, " ▒██▀▀█▄  ▒██▀▀█▄  ▒██   ██ ░▓██▒  ▐▌██▒▒██   ██░\n")
+	fmt.Fprintf(os.Stderr, " ░██▓ ▒██▒░██▓ ▒██▒░ ████▓▒░░▒██░   ▓██░░ ████▓▒░\n")
+	fmt.Fprintf(os.Stderr, " ░ ▒▓ ░▒▓░░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░   ▒ ▒ ░ ▒░▒░▒░ \n")
+	fmt.Fprintf(os.Stderr, "   ░▒ ░ ▒░  ░▒ ░ ▒░  ░ ▒ ▒░   ░ ░░ ░ ░ ▒   ░ ▒ ▒░ \n")
+	fmt.Fprintf(os.Stderr, "   ░░   ░   ░░   ░ ░ ░ ░ ▒     ░░   ░  ░   ░ ░ ▒  \n")
+	fmt.Fprintf(os.Stderr, "    ░        ░           ░ ░      ░          ░  ░  \n")
+	fmt.Fprintf(os.Stderr, "                  Protocol Fuzzing Honeypot          \n")
+	fmt.Fprintf(os.Stderr, "                         v%s                      \n\n", version)
 }
 
 // isTemporaryAcceptError reports whether an Accept error is transient and
@@ -407,6 +557,7 @@ func listenPort(
 	secLog *logger.SecurityLogger,
 	stats *statsCounters,
 	conns *connectionTracker,
+	hits *hitReporter,
 ) error {
 	addr := ":" + strconv.Itoa(port)
 
@@ -520,7 +671,7 @@ func listenPort(
 		// Try to acquire a handler slot (non-blocking).
 		// If at capacity, close immediately to prevent goroutine explosion.
 		if conns.acquire() {
-			go handleConnection(conn, port, cfg, log, stats, conns)
+			go handleConnection(conn, port, cfg, log, stats, conns, hits)
 		} else {
 			// At capacity — close immediately, log throttle event
 			secLog.LogThrottled(conn.RemoteAddr().String(), port)
@@ -530,7 +681,7 @@ func listenPort(
 	}
 }
 
-func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.Logger, stats *statsCounters, conns *connectionTracker) {
+func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.Logger, stats *statsCounters, conns *connectionTracker, hits *hitReporter) {
 	defer conn.Close()
 	defer conns.release() // frees the slot and marks this handler finished
 	defer func() {
@@ -579,10 +730,9 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
 			stats.errors.Add(1)
 		}
 
-		// Console output
-		fmt.Fprintf(os.Stderr, "  [hit] %s:%d → :%d  %d bytes  %q\n",
-			event.SourceIP, event.SourcePort, port,
-			event.Size, truncate(event.Printable, 80))
+		// Console output, rate-limited: see hitReporter.
+		hits.report(event.SourceIP, event.SourcePort, port,
+			event.Size, event.Printable)
 	}
 }
 
@@ -659,5 +809,8 @@ func truncatePortList(ports []int, max int) string {
 	if len(ports) <= max {
 		return "(" + formatPortList(ports) + ")"
 	}
-	return "(" + formatPortList(ports[:max]) + fmt.Sprintf(", +%d more)", len(ports)-max) + ")"
+	// Note: the format string must not carry its own closing paren — the
+	// surrounding "(" and ")" are added here, and the original version
+	// produced "(1, 2, 3, +2 more))".
+	return "(" + formatPortList(ports[:max]) + fmt.Sprintf(", +%d more", len(ports)-max) + ")"
 }

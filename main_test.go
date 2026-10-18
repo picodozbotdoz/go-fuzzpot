@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -78,7 +81,7 @@ func TestAcceptLoop_CtxCancelDuringIdleAccept(t *testing.T) {
 	port := freeTCPPort(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- listenPort(ctx, port, cfg, pm, log, secLog, &stats, conns)
+		done <- listenPort(ctx, port, cfg, pm, log, secLog, &stats, conns, newHitReporter(io.Discard))
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -269,7 +272,7 @@ func TestEndToEnd_FullPipeline(t *testing.T) {
 			}
 			stats.connections.Add(1)
 			conns.acquire()
-			go handleConnection(conn, port, cfg, log, &stats, conns)
+			go handleConnection(conn, port, cfg, log, &stats, conns, newHitReporter(io.Discard))
 		}
 	}()
 
@@ -406,7 +409,7 @@ func TestEndToEnd_Throttling(t *testing.T) {
 
 			// Try to acquire — full tracker means throttle
 			if conns.acquire() {
-				go handleConnection(conn, 0, cfg, log, &stats, conns)
+				go handleConnection(conn, 0, cfg, log, &stats, conns, newHitReporter(io.Discard))
 			} else {
 				stats.throttled.Add(1)
 				conn.Close()
@@ -485,7 +488,7 @@ func TestEndToEnd_LogHexPayloadDisabled(t *testing.T) {
 			}
 			stats.connections.Add(1)
 			conns.acquire()
-			go handleConnection(conn, port, cfg, log, &stats, conns)
+			go handleConnection(conn, port, cfg, log, &stats, conns, newHitReporter(io.Discard))
 		}
 	}()
 
@@ -563,7 +566,7 @@ func TestHandleConnection_PanicRecovery(t *testing.T) {
 	conns.acquire() // reserve the slot the handler will release
 
 	go func() {
-		handleConnection(conn, 9999, cfg, nil, &stats, conns)
+		handleConnection(conn, 9999, cfg, nil, &stats, conns, newHitReporter(io.Discard))
 		done <- struct{}{}
 	}()
 
@@ -637,4 +640,298 @@ func TestConnectionTracker_WaitTimesOut(t *testing.T) {
 		t.Fatalf("wait() = %d outstanding handlers, want 1", n)
 	}
 	conns.release()
+}
+
+// ── app wiring and supervision loop (D-08) ────────────────────────────────
+
+func newTestApp(t *testing.T, cfg *config.Config, targets []int) *app {
+	t.Helper()
+	tmpDir := t.TempDir()
+
+	log, err := logger.New(tmpDir, "app.log", 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { log.Close() })
+
+	secLog, err := logger.NewSecurityLogger(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { secLog.Close() })
+
+	return &app{
+		cfg:     cfg,
+		log:     log,
+		secLog:  secLog,
+		pm:      portscan.NewPortManager(cfg.Ports.Exclude),
+		targets: targets,
+		conns:   newConnectionTracker(4),
+	}
+}
+
+func TestPortRanges_FlattensConfig(t *testing.T) {
+	cfg := &config.Config{Ports: config.PortsConfig{
+		Ranges: []config.PortRange{{From: 20, To: 22}, {From: 80, To: 80}},
+	}}
+
+	got := portRanges(cfg)
+	want := [][2]int{{20, 22}, {80, 80}}
+	if len(got) != len(want) {
+		t.Fatalf("portRanges() returned %d ranges, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("range %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestNewApp_ResolvesSortedTargetsAndExcludes(t *testing.T) {
+	cfg := &config.Config{Ports: config.PortsConfig{
+		Ranges:  []config.PortRange{{From: 2000, To: 2004}},
+		Exclude: []int{2002},
+	}}
+
+	a, targets := newApp(cfg, nil, nil, portRanges(cfg))
+
+	if a.conns == nil {
+		t.Fatal("newApp did not build a connection tracker")
+	}
+	if len(targets) == 0 {
+		t.Fatal("newApp resolved zero targets")
+	}
+	for i := 1; i < len(targets); i++ {
+		if targets[i-1] >= targets[i] {
+			t.Fatalf("targets not sorted: %v", targets)
+		}
+	}
+	for _, p := range targets {
+		if p == 2002 {
+			t.Fatal("excluded port 2002 appears in targets")
+		}
+	}
+	if len(a.targets) != len(targets) {
+		t.Fatalf("app.targets has %d entries, returned %d", len(a.targets), len(targets))
+	}
+}
+
+// run() must return promptly on ctx cancel and drain before returning. With no
+// targets there are no listeners to bind, which keeps the test fast and
+// port-free while still exercising the supervision loop and shutdown path.
+func TestAppRun_ReturnsAfterCancel(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	cfg := &config.Config{Refresh: config.RefreshConfig{IntervalSec: 5}}
+	a := newTestApp(t, cfg, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		a.run(ctx)
+		close(done)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run() did not return after ctx cancel")
+	}
+}
+
+// drain() must wait for a handler that is still writing, then report zero.
+func TestAppDrain_WaitsForInFlightHandler(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+
+	// Simulate one handler holding a slot.
+	a.conns.acquire()
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		a.conns.release()
+	}()
+
+	var listeners sync.WaitGroup
+	start := time.Now()
+	a.drain(&listeners)
+	elapsed := time.Since(start)
+
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("drain() returned in %v; it did not wait for the in-flight handler", elapsed)
+	}
+	if n := a.conns.wait(time.Second); n != 0 {
+		t.Fatalf("%d handler(s) still outstanding after drain", n)
+	}
+}
+
+func TestAppReportStats_ExitsOnCancel(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+
+	done := make(chan struct{})
+	go func() {
+		a.reportStats(ctx, ticker)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reportStats did not exit after ctx cancel")
+	}
+}
+
+func TestAppCheckConflicts_NoConflictsIsQuiet(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+	// Nothing is listening, so this must be a no-op rather than a panic.
+	a.checkConflicts()
+}
+
+func TestWatchSignals_ShutdownSignalCancels(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	a.watchSignals(sigCh, cancel)
+
+	sigCh <- syscall.SIGTERM
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown signal did not cancel the context")
+	}
+}
+
+func TestWatchSignals_HealthSignalDoesNotCancel(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	a.watchSignals(sigCh, cancel)
+
+	// Anything other than INT/TERM is treated as the health-check signal.
+	sigCh <- syscall.Signal(99)
+
+	select {
+	case <-ctx.Done():
+		t.Fatal("health signal must not cancel the context")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	cases := []struct {
+		in   string
+		max  int
+		want string
+	}{
+		{"hello", 10, "hello"},
+		{"hello", 5, "hello"},
+		{"hello", 3, "hel..."},
+		{"héllo", 5, "héllo"},  // rune-aware: 5 runes, not 6 bytes
+		{"héllo", 3, "hél..."}, // must not split a multi-byte rune
+		{"", 0, ""},
+	}
+	for _, tc := range cases {
+		if got := truncate(tc.in, tc.max); got != tc.want {
+			t.Errorf("truncate(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+		}
+	}
+}
+
+func TestFormatPortList(t *testing.T) {
+	if got := formatPortList(nil); got != "" {
+		t.Errorf("formatPortList(nil) = %q, want empty", got)
+	}
+	if got := formatPortList([]int{1, 22, 80}); got != "1, 22, 80" {
+		t.Errorf("formatPortList = %q, want %q", got, "1, 22, 80")
+	}
+}
+
+func TestTruncatePortList(t *testing.T) {
+	if got := truncatePortList(nil, 8); got != "(none)" {
+		t.Errorf("empty list = %q, want (none)", got)
+	}
+	if got := truncatePortList([]int{1, 2}, 8); got != "(1, 2)" {
+		t.Errorf("short list = %q, want (1, 2)", got)
+	}
+	if got := truncatePortList([]int{1, 2, 3, 4, 5}, 3); got != "(1, 2, 3, +2 more)" {
+		t.Errorf("truncated list = %q, want (1, 2, 3, +2 more)", got)
+	}
+}
+
+func TestShowPortSummary_EmptyAndLong(t *testing.T) {
+	// Writes to stderr; the contract under test is "does not panic and does not
+	// index out of range" for both the empty and the >20 port shapes.
+	showPortSummary(nil)
+	showPortSummary([]int{1})
+	many := make([]int, 25)
+	for i := range many {
+		many[i] = 1000 + i
+	}
+	showPortSummary(many)
+}
+
+func TestShowConflictAnalysis_EmptyRanges(t *testing.T) {
+	cfg := &config.Config{}
+	pm := portscan.NewPortManager(nil)
+	showConflictAnalysis(pm, nil, cfg)
+}
+
+func TestPrintBanner_DoesNotPanic(t *testing.T) {
+	printBanner()
+}
+
+// ── hitReporter (D-10) ────────────────────────────────────────────────────
+
+func TestHitReporter_LimitsBurstPerWindow(t *testing.T) {
+	var buf bytes.Buffer
+	r := newHitReporter(&buf)
+	fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return fixed }
+
+	for i := 0; i < hitConsoleBurst+5; i++ {
+		r.report("10.0.0.1", 40000+i, 22, 10, "x")
+	}
+
+	if got := strings.Count(buf.String(), "[hit] 10.0.0.1"); got != hitConsoleBurst {
+		t.Fatalf("emitted %d hit lines, want %d (burst cap)", got, hitConsoleBurst)
+	}
+}
+
+func TestHitReporter_ReportsSuppressedOnNextWindow(t *testing.T) {
+	var buf bytes.Buffer
+	r := newHitReporter(&buf)
+	fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return fixed }
+
+	const extra = 3
+	for i := 0; i < hitConsoleBurst+extra; i++ {
+		r.report("10.0.0.1", 40000+i, 22, 10, "x")
+	}
+
+	buf.Reset()
+	r.now = func() time.Time { return fixed.Add(2 * time.Second) }
+	r.report("10.0.0.2", 50000, 22, 10, "y")
+
+	out := buf.String()
+	if !strings.Contains(out, "3 more hit(s) suppressed") {
+		t.Fatalf("suppression summary missing from output: %q", out)
+	}
+	if !strings.Contains(out, "10.0.0.2") {
+		t.Fatalf("first hit of the new window was not printed: %q", out)
+	}
 }
