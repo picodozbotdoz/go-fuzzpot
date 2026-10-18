@@ -282,3 +282,111 @@ func TestCapture_NonTCPNoPanic(t *testing.T) {
 		t.Errorf("expected empty SourceIP for non-TCP conn, got %q", event.SourceIP)
 	}
 }
+
+// ── G5: hard cap + truncation flag ─────────────────────────────────────────
+
+func TestCapture_SizeNeverExceedsCap(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	payload := make([]byte, 200)
+	for i := range payload {
+		payload[i] = 'A'
+	}
+
+	go func() {
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.Write(payload) // single write larger than the cap
+		time.Sleep(200 * time.Millisecond)
+	}()
+
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	event := Capture(server, time.Second, 50)
+	if event.Size != 50 {
+		t.Errorf("Size = %d, want exactly the 50-byte cap (G5: never overshoot)", event.Size)
+	}
+	if !event.Truncated {
+		t.Error("Truncated = false, want true when the cap stopped the capture")
+	}
+}
+
+func TestCapture_NotTruncatedUnderCap(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.Write([]byte("short payload"))
+	}()
+
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	event := Capture(server, time.Second, 65536)
+	if event.Size != len("short payload") {
+		t.Fatalf("Size = %d, want %d", event.Size, len("short payload"))
+	}
+	if event.Truncated {
+		t.Error("Truncated = true for a complete payload under the cap, want false")
+	}
+}
+
+// ── G6: first-byte timestamp ───────────────────────────────────────────────
+
+func TestCapture_TimestampIsFirstByteNotCompletion(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	drip := 250 * time.Millisecond
+	go func() {
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.Write([]byte("first"))
+		time.Sleep(drip) // slow-drip sender holds the capture open
+		conn.Write([]byte("-second"))
+	}()
+
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	done := make(chan Event, 1)
+	go func() { done <- Capture(server, 5*time.Second, 65536) }()
+	event := <-done
+
+	completion := time.Now()
+	age := completion.Sub(event.Timestamp)
+	if age < drip {
+		t.Errorf("Timestamp is completion time (age %v < drip %v); want it stamped at the first byte (G6)", age, drip)
+	}
+}

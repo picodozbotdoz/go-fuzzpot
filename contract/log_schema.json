@@ -8,12 +8,12 @@
   "additionalProperties": false,
   "properties": {
     "v": {
-      "description": "Schema version. Lines written before versioning exist lack this field and are treated by consumers as v1-compatible.",
+      "description": "Schema version. Lines written before versioning exist lack this field and are treated by consumers as v1-compatible. v2 adds the optional `truncated` flag and first-byte `ts` timestamps with sub-second precision.",
       "type": "integer",
-      "const": 1
+      "enum": [1, 2]
     },
     "ts": {
-      "description": "Event timestamp, RFC 3339 / ISO 8601 with timezone offset.",
+      "description": "Event timestamp, RFC 3339 / ISO 8601 with timezone offset. Since v2: time of the first payload byte (not capture completion), at nanosecond precision when the clock provides it.",
       "type": "string",
       "minLength": 20
     },
@@ -40,7 +40,7 @@
       "enum": ["tcp", "udp"]
     },
     "size": {
-      "description": "Payload size in bytes.",
+      "description": "Payload size in bytes. Since v2 this never exceeds the producer's max_payload_size.",
       "type": "integer",
       "minimum": 0
     },
@@ -56,6 +56,10 @@
       "description": "SHA-256 of the raw payload (64 lowercase hex chars); omitted only in very old producers.",
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "truncated": {
+      "description": "v2 only: true when capture stopped at max_payload_size — more bytes may have followed. A payload exactly max_payload_size bytes long is also flagged (conservatively). Omitted when false; v1 lines carry no truncation information.",
+      "type": "boolean"
     }
   }
 }

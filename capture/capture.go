@@ -11,7 +11,7 @@ import (
 
 // Event represents a single captured payload from an attacker.
 type Event struct {
-	Timestamp     time.Time `json:"timestamp"`
+	Timestamp     time.Time `json:"timestamp"` // first byte received
 	SourceIP      string    `json:"source_ip"`
 	SourcePort    int       `json:"source_port"`
 	DestPort      int       `json:"dest_port"`
@@ -20,6 +20,7 @@ type Event struct {
 	Hex           string    `json:"hex"`                      // hex dump of payload
 	Printable     string    `json:"printable"`                // printable ASCII portion
 	PayloadSHA256 string    `json:"payload_sha256,omitempty"` // SHA256 hash for threat intel
+	Truncated     bool      `json:"truncated,omitempty"`      // stopped at maxLen (G5)
 	Raw           []byte    `json:"-"`
 }
 
@@ -39,20 +40,43 @@ func (e Event) JSONLine() string {
 }
 
 // Capture reads from the connection until timeout or buffer full.
+//
+// G5: Size never exceeds maxLen — each read takes min(remaining, chunk)
+// bytes. When the cap stops the loop, Truncated is set; a payload that
+// happened to be exactly maxLen bytes is conservatively reported as
+// truncated too (a probe read would burn the rest of the deadline).
+//
+// G6: Timestamp is the time the first byte arrived, not capture
+// completion — a slow-drip sender no longer skews ordering and the
+// analyzer's rate windows by up to the whole timeout.
 func Capture(conn net.Conn, timeout time.Duration, maxLen int) Event {
 	var buf []byte
+	start := time.Now()
+	firstByte := time.Time{}
 
-	conn.SetReadDeadline(time.Now().Add(timeout))
+	conn.SetReadDeadline(start.Add(timeout))
 	tmp := make([]byte, 4096)
 
 	for len(buf) < maxLen {
+		remaining := maxLen - len(buf)
+		if remaining < len(tmp) {
+			tmp = tmp[:remaining]
+		}
 		n, err := conn.Read(tmp)
 		if n > 0 {
+			if firstByte.IsZero() {
+				firstByte = time.Now()
+			}
 			buf = append(buf, tmp[:n]...)
 		}
 		if err != nil {
 			break // timeout, connection closed, or error
 		}
+	}
+	truncated := len(buf) >= maxLen && maxLen > 0
+	ts := firstByte
+	if ts.IsZero() {
+		ts = start // zero-byte event: fall back to capture start
 	}
 
 	remote, ok := conn.RemoteAddr().(*net.TCPAddr)
@@ -60,11 +84,12 @@ func Capture(conn net.Conn, timeout time.Duration, maxLen int) Event {
 		// Safety: if RemoteAddr is not *net.TCPAddr (e.g. wrapped conn),
 		// return an empty event rather than panicking.
 		return Event{
-			Timestamp: time.Now(),
+			Timestamp: ts,
 			Proto:     "tcp",
 			Size:      len(buf),
 			Hex:       hex.EncodeToString(buf),
 			Printable: extractPrintable(buf),
+			Truncated: truncated,
 			Raw:       buf,
 		}
 	}
@@ -77,7 +102,7 @@ func Capture(conn net.Conn, timeout time.Duration, maxLen int) Event {
 	}
 
 	return Event{
-		Timestamp:     time.Now(),
+		Timestamp:     ts,
 		SourceIP:      remote.IP.String(),
 		SourcePort:    remote.Port,
 		Proto:         "tcp",
@@ -85,6 +110,7 @@ func Capture(conn net.Conn, timeout time.Duration, maxLen int) Event {
 		Hex:           hex.EncodeToString(buf),
 		Printable:     extractPrintable(buf),
 		PayloadSHA256: payloadSHA,
+		Truncated:     truncated,
 		Raw:           buf,
 	}
 }

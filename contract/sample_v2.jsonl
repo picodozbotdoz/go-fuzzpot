@@ -1,0 +1,2 @@
+{"v":2,"ts":"2026-10-19T03:41:02.483921087Z","src_ip":"45.148.10.87","src_port":51022,"dst_port":445,"proto":"tcp","size":65536,"printable":"SMB negotiation truncated by capture cap","hex":"fe534d42800001000008030000","payload_sha256":"b7c1f2d3e4a5061728394a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f9","truncated":true}
+{"v":2,"ts":"2026-10-19T03:41:03.000512Z","src_ip":"45.148.10.87","src_port":51023,"dst_port":2222,"proto":"tcp","size":21,"printable":"SSH-2.0-libssh_0.9.6","payload_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}

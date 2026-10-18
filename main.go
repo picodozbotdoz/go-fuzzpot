@@ -46,7 +46,9 @@ var (
 // logSchemaVersion is the JSONL contract version emitted in every
 // LogEntry's `v` field (B1-8). v1 = the original field set plus `v`
 // itself; consumers treat a missing `v` as pre-versioning v1.
-const logSchemaVersion = 1
+// v2 adds the optional `truncated` flag (G5) and first-byte `ts` with
+// sub-second precision (G6).
+const logSchemaVersion = 2
 
 // LogEntry is a typed struct for JSON log serialization.
 // Using json.Marshal on a struct ensures proper escaping of all special
@@ -55,8 +57,10 @@ const logSchemaVersion = 1
 // Schema version (B1-8): `v` identifies the JSONL contract version. v1
 // adds the field itself on top of the original schema; consumers must
 // treat a missing `v` as the pre-versioning format (field-compatible
-// with v1). The contract is validated in both fuzzpot and fuzz-sec-intel
-// (contract/contract_test.go ↔ tests/test_contract.py).
+// with v1). v2 adds `truncated` (omitted when false) and switches `ts`
+// to first-byte time at RFC3339Nano precision. The contract is validated
+// in both fuzzpot and fuzz-sec-intel (contract/contract_test.go ↔
+// tests/test_contract.py).
 type LogEntry struct {
 	V             int    `json:"v"`
 	Timestamp     string `json:"ts"`
@@ -68,6 +72,7 @@ type LogEntry struct {
 	Printable     string `json:"printable"` // json.Marshal handles escaping
 	Hex           string `json:"hex,omitempty"`
 	PayloadSHA256 string `json:"payload_sha256,omitempty"` // SHA256 hash for threat intel
+	Truncated     bool   `json:"truncated,omitempty"`      // payload stopped at the cap (G5)
 }
 
 // statsCounters holds process-lifetime counters. All fields are atomic and
@@ -824,7 +829,7 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
 		// Write to log using typed struct for proper JSON escaping
 		logEntry := LogEntry{
 			V:             logSchemaVersion,
-			Timestamp:     event.Timestamp.UTC().Format(time.RFC3339),
+			Timestamp:     event.Timestamp.UTC().Format(time.RFC3339Nano), // first-byte time (G6)
 			SourceIP:      event.SourceIP,
 			SourcePort:    event.SourcePort,
 			DestPort:      port,
@@ -832,6 +837,7 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
 			Size:          event.Size,
 			Printable:     event.Printable, // json.Marshal will escape correctly
 			PayloadSHA256: event.PayloadSHA256,
+			Truncated:     event.Truncated, // omitted from JSON when false
 		}
 
 		// Hex payload is large (~2x raw size); omit it when configured
