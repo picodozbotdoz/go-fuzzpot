@@ -23,15 +23,18 @@ Every connection is logged as a JSON line with:
 
 | Field | Description |
 |---|---|
-| `v` | Schema version (`1`; lines from pre-versioning builds lack it and are v1-compatible) |
-| `ts` | Timestamp (ISO 8601) |
+| `v` | Schema version (`1` or `2`; lines from pre-versioning builds lack it and are v1-compatible) |
+| `ts` | Timestamp of the **first payload byte** (ISO 8601, sub-second precision since v2) |
 | `src_ip` | Attacker IP |
 | `src_port` | Attacker source port |
 | `dst_port` | Target port hit |
 | `proto` | Protocol (`tcp`) |
-| `size` | Payload size in bytes |
+| `size` | Payload size in bytes — never exceeds `max_payload_size` (v2) |
 | `printable` | Printable ASCII representation |
 | `hex` | Full hex dump of the payload |
+| `truncated` | v2 only: `true` when capture stopped at `max_payload_size` (more bytes may have followed; an exactly-cap-sized payload is also flagged). Omitted when `false` |
+
+**v2 changes (vs v1):** `size` is a hard cap (v1 could overshoot by one read chunk), `ts` is the first-byte time rather than capture completion, and `truncated` makes cap-truncation visible downstream.
 
 The machine-readable schema lives in [`contract/log_schema.json`](contract/log_schema.json) and is validated by contract tests in both fuzzpot and [fuzz-sec-intel](https://github.com/picodozbotdoz/fuzz-sec-intel) — changes must land as coordinated commits in both repos.
 
