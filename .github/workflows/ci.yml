@@ -1,0 +1,95 @@
+# Drop-in CI for go-fuzzpot.
+# Destination: repo/go-fuzzpot/.github/workflows/ci.yml
+# Rationale: the repo currently has NO CI at all, so every gate below is new.
+name: CI
+
+on:
+  push:
+    branches: [z/dev, master, main, "imp/*", "exp/*"]
+  pull_request:
+    branches: [z/dev, master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # go.mod declares go 1.25.0; let the toolchain self-install if the runner lags.
+  GOTOOLCHAIN: auto
+
+jobs:
+  lint:
+    name: Format & static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: gofmt (fail on unformatted files)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.61
+          # Start permissive; tighten in week 5 of the upgrade plan.
+          args: --timeout=5m --disable-all -E govet,errcheck,staticcheck,ineffassign,unused,gocritic
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Build
+        run: go build -o fuzzpot-bin .
+
+      - name: Unit tests
+        run: go test -covermode=atomic -coverprofile=cover.out ./...
+
+      # The dev host is Windows and the race detector needs cgo; Linux is the
+      # authoritative race lane. Windows still runs plain tests above.
+      - name: Race detector
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./...
+
+      - name: Coverage gate (45% floor, ratchet upward)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          total="$(go tool cover -func=cover.out | tail -1 | awk '{print $3}' | tr -d '%')"
+          echo "total coverage: ${total}%"
+          # Floor is deliberately below today's measured value so the gate
+          # blocks regressions without freezing the team. Raise it monthly.
+          if awk -v t="$total" 'BEGIN{exit !(t < 45)}'; then
+            echo "::error::coverage ${total}% is below the 45% floor"
+            exit 1
+          fi
+
+      - name: Upload coverage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: cover.out
+          retention-days: 7
