@@ -55,7 +55,7 @@ func TestAcceptLoop_CtxCancelDuringIdleAccept(t *testing.T) {
 	// Guards the new backoff control flow: the loop must still exit
 	// promptly on ctx cancel while sitting in Accept/backoff.
 	var stats statsCounters
-	connSem := make(chan struct{}, 4)
+	conns := newConnectionTracker(4)
 
 	cfg := &config.Config{
 		Capture: config.CaptureConfig{ReadTimeoutSec: 1, MaxPayloadSize: 1024},
@@ -78,7 +78,7 @@ func TestAcceptLoop_CtxCancelDuringIdleAccept(t *testing.T) {
 	port := freeTCPPort(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- listenPort(ctx, port, cfg, pm, log, secLog, &stats, connSem)
+		done <- listenPort(ctx, port, cfg, pm, log, secLog, &stats, conns)
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -241,8 +241,8 @@ func TestEndToEnd_FullPipeline(t *testing.T) {
 	// Stats (same counters handleConnection increments)
 	var stats statsCounters
 
-	// Connection semaphore (generous limit)
-	connSem := make(chan struct{}, 100)
+	// Connection tracker (generous limit)
+	conns := newConnectionTracker(100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -268,8 +268,8 @@ func TestEndToEnd_FullPipeline(t *testing.T) {
 				continue
 			}
 			stats.connections.Add(1)
-			connSem <- struct{}{}
-			go handleConnection(conn, port, cfg, log, &stats, connSem)
+			conns.acquire()
+			go handleConnection(conn, port, cfg, log, &stats, conns)
 		}
 	}()
 
@@ -380,8 +380,8 @@ func TestEndToEnd_Throttling(t *testing.T) {
 
 	var stats statsCounters
 
-	// Tiny semaphore (1 slot) to force throttling
-	connSem := make(chan struct{}, 1)
+	// Tiny tracker (1 slot) to force throttling
+	conns := newConnectionTracker(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -404,11 +404,10 @@ func TestEndToEnd_Throttling(t *testing.T) {
 			}
 			stats.connections.Add(1)
 
-			// Try to acquire — full semaphore means throttle
-			select {
-			case connSem <- struct{}{}:
-				go handleConnection(conn, 0, cfg, log, &stats, connSem)
-			default:
+			// Try to acquire — full tracker means throttle
+			if conns.acquire() {
+				go handleConnection(conn, 0, cfg, log, &stats, conns)
+			} else {
 				stats.throttled.Add(1)
 				conn.Close()
 			}
@@ -467,7 +466,7 @@ func TestEndToEnd_LogHexPayloadDisabled(t *testing.T) {
 
 	var stats statsCounters
 
-	connSem := make(chan struct{}, 100)
+	conns := newConnectionTracker(100)
 	cancel := func() {} // no-op, ln.Close() suffices for cleanup
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -485,8 +484,8 @@ func TestEndToEnd_LogHexPayloadDisabled(t *testing.T) {
 				return
 			}
 			stats.connections.Add(1)
-			connSem <- struct{}{}
-			go handleConnection(conn, port, cfg, log, &stats, connSem)
+			conns.acquire()
+			go handleConnection(conn, port, cfg, log, &stats, conns)
 		}
 	}()
 
@@ -560,11 +559,11 @@ func TestHandleConnection_PanicRecovery(t *testing.T) {
 
 	// Use a buffered channel to detect completion
 	done := make(chan struct{}, 1)
-	connSem := make(chan struct{}, 1)
-	connSem <- struct{}{} // pre-fill so the defer release works
+	conns := newConnectionTracker(1)
+	conns.acquire() // reserve the slot the handler will release
 
 	go func() {
-		handleConnection(conn, 9999, cfg, nil, &stats, connSem)
+		handleConnection(conn, 9999, cfg, nil, &stats, conns)
 		done <- struct{}{}
 	}()
 
@@ -578,4 +577,64 @@ func TestHandleConnection_PanicRecovery(t *testing.T) {
 	if got := stats.errors.Load(); got != 1 {
 		t.Errorf("errors = %d, want 1 (panic should be counted)", got)
 	}
+}
+
+// ── connectionTracker (DEFECT-03) ─────────────────────────────────────────
+
+func TestConnectionTracker_AcquireRespectsCapacity(t *testing.T) {
+	conns := newConnectionTracker(2)
+	if !conns.acquire() {
+		t.Fatal("first acquire failed")
+	}
+	if !conns.acquire() {
+		t.Fatal("second acquire failed")
+	}
+	if conns.acquire() {
+		t.Fatal("acquire succeeded past capacity; throttling would break")
+	}
+	conns.release()
+	if !conns.acquire() {
+		t.Fatal("acquire failed after a slot was released")
+	}
+	conns.release()
+	conns.release()
+}
+
+// wait() must block while a handler is still running. Without this, shutdown
+// closes the log file underneath an in-flight WriteEventTyped call.
+func TestConnectionTracker_WaitBlocksUntilRelease(t *testing.T) {
+	conns := newConnectionTracker(2)
+	conns.acquire()
+
+	waited := make(chan int, 1)
+	go func() { waited <- conns.wait(5 * time.Second) }()
+
+	select {
+	case n := <-waited:
+		t.Fatalf("wait() returned %d while a handler was still in flight", n)
+	case <-time.After(80 * time.Millisecond):
+		// Expected: still blocked.
+	}
+
+	conns.release()
+
+	select {
+	case n := <-waited:
+		if n != 0 {
+			t.Fatalf("wait() = %d outstanding handlers, want 0", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait() did not return after the last handler released")
+	}
+}
+
+// A hung handler must not block shutdown forever; wait() reports the remainder.
+func TestConnectionTracker_WaitTimesOut(t *testing.T) {
+	conns := newConnectionTracker(1)
+	conns.acquire()
+
+	if n := conns.wait(20 * time.Millisecond); n != 1 {
+		t.Fatalf("wait() = %d outstanding handlers, want 1", n)
+	}
+	conns.release()
 }

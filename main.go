@@ -9,9 +9,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -29,6 +31,10 @@ const (
 	acceptBackoffInitial  = 100 * time.Millisecond
 	acceptBackoffMax      = 10 * time.Second
 	acceptRebindThreshold = 5
+
+	// shutdownGracePeriod bounds how long shutdown waits for in-flight
+	// handlers to finish writing before the log files are closed.
+	shutdownGracePeriod = 10 * time.Second
 )
 
 var (
@@ -74,6 +80,66 @@ type statsCounters struct {
 
 func (s *statsCounters) snapshot() (connections, payloads, errs, throttled int64) {
 	return s.connections.Load(), s.payloads.Load(), s.errors.Load(), s.throttled.Load()
+}
+
+// connectionTracker bounds the number of concurrent handlers and tracks their
+// lifetime. Without the WaitGroup, shutdown returned while handlers were still
+// writing to the log, so deferred Close calls raced in-flight writes and
+// payloads were lost.
+type connectionTracker struct {
+	sem chan struct{}
+	wg  sync.WaitGroup
+}
+
+func newConnectionTracker(maxConcurrent int) *connectionTracker {
+	if maxConcurrent < 1 {
+		maxConcurrent = 1
+	}
+	return &connectionTracker{sem: make(chan struct{}, maxConcurrent)}
+}
+
+// acquire reserves a handler slot without blocking. It reports false when the
+// tracker is at capacity, in which case the caller must close the connection.
+func (t *connectionTracker) acquire() bool {
+	select {
+	case t.sem <- struct{}{}:
+		t.wg.Add(1)
+		return true
+	default:
+		return false
+	}
+}
+
+// release frees a slot reserved by acquire and marks the handler finished.
+func (t *connectionTracker) release() {
+	<-t.sem
+	t.wg.Done()
+}
+
+// waitOrTimeout waits for wg to drain, reporting false if timeout expires
+// first. Callers must decide what a false return means for them.
+func waitOrTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// wait blocks until every in-flight handler has finished, or until timeout
+// expires. It returns the number of handlers still running; a non-zero result
+// means shutdown proceeded with work outstanding and should be logged.
+func (t *connectionTracker) wait(timeout time.Duration) int {
+	if waitOrTimeout(&t.wg, timeout) {
+		return 0
+	}
+	return len(t.sem)
 }
 
 func main() {
@@ -193,23 +259,31 @@ func main() {
 	// Connection limiter — prevent goroutine explosion under flood.
 	// Dynamically set maxConcurrent based on system file descriptor limit
 	// to prevent DoS from exhausting all available FDs.
-	connSem := make(chan struct{}, maxConnections())
+	conns := newConnectionTracker(maxConnections())
 	// Stats
 	var stats statsCounters
 	statsWriter := time.NewTicker(10 * time.Second)
+	defer statsWriter.Stop()
 	go func() {
-		for range statsWriter.C {
-			conn, pay, errs, throt := stats.snapshot()
-			listening := pm.ListeningCount()
-			fmt.Fprintf(os.Stderr, "  [stats] listening:%d  connections:%d  payloads:%d  errors:%d  throttled:%d\n",
-				listening, conn, pay, errs, throt)
-			slogLogger.Info("stats_tick",
-				"listening_ports", listening,
-				"connections_total", conn,
-				"payloads_captured", pay,
-				"errors_total", errs,
-				"connections_throttled", throt,
-			)
+		// Select on ctx: Ticker.Stop() does not close the channel, so a bare
+		// `for range` would block this goroutine forever at shutdown.
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-statsWriter.C:
+				conn, pay, errs, throt := stats.snapshot()
+				listening := pm.ListeningCount()
+				fmt.Fprintf(os.Stderr, "  [stats] listening:%d  connections:%d  payloads:%d  errors:%d  throttled:%d\n",
+					listening, conn, pay, errs, throt)
+				slogLogger.Info("stats_tick",
+					"listening_ports", listening,
+					"connections_total", conn,
+					"payloads_captured", pay,
+					"errors_total", errs,
+					"connections_throttled", throt,
+				)
+			}
 		}
 	}()
 
@@ -234,14 +308,19 @@ func main() {
 		}
 	}()
 
-	// Start listeners
+	// Start listeners. Tracked separately from connections: a listener can
+	// still write to the security log (throttle events) after the main loop
+	// has decided to shut down, so shutdown must wait for these too.
+	var listeners sync.WaitGroup
 	for _, port := range targets {
 		p := port
 		if ctx.Err() != nil {
 			break
 		}
+		listeners.Add(1)
 		go func() {
-			err := listenPort(ctx, p, cfg, pm, log, secLog, &stats, connSem)
+			defer listeners.Done()
+			err := listenPort(ctx, p, cfg, pm, log, secLog, &stats, conns)
 			if err != nil && ctx.Err() == nil {
 				stats.errors.Add(1)
 			}
@@ -258,7 +337,22 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			statsWriter.Stop()
+			// Drain in-flight handlers before returning: the deferred
+			// log.Close/secLog.Close calls run after this, and a handler still
+			// inside WriteEventTyped would then write to a closed file and lose
+			// the payload it had just captured.
+			if n := conns.wait(shutdownGracePeriod); n > 0 {
+				slogLogger.Warn("shutdown_timeout",
+					"in_flight_handlers", n,
+					"grace_period_sec", int(shutdownGracePeriod.Seconds()),
+				)
+				fmt.Fprintf(os.Stderr, "  [!] shutdown timed out with %d handler(s) still running\n", n)
+			}
+			// Listeners exit on ctx cancel, but may still be finishing a
+			// throttle-log write; give them the same bounded grace period.
+			if !waitOrTimeout(&listeners, shutdownGracePeriod) {
+				slogLogger.Warn("shutdown_timeout", "component", "listeners")
+			}
 			conn, pay, errs, throt := stats.snapshot()
 			fmt.Fprintf(os.Stderr, "  [*] Final: connections=%d payloads=%d errors=%d throttled=%d\n",
 				conn, pay, errs, throt)
@@ -312,7 +406,7 @@ func listenPort(
 	log *logger.Logger,
 	secLog *logger.SecurityLogger,
 	stats *statsCounters,
-	connSem chan struct{},
+	conns *connectionTracker,
 ) error {
 	addr := ":" + strconv.Itoa(port)
 
@@ -423,12 +517,11 @@ func listenPort(
 
 		stats.connections.Add(1)
 
-		// Try to acquire a slot in the semaphore (non-blocking).
+		// Try to acquire a handler slot (non-blocking).
 		// If at capacity, close immediately to prevent goroutine explosion.
-		select {
-		case connSem <- struct{}{}:
-			go handleConnection(conn, port, cfg, log, stats, connSem)
-		default:
+		if conns.acquire() {
+			go handleConnection(conn, port, cfg, log, stats, conns)
+		} else {
 			// At capacity — close immediately, log throttle event
 			secLog.LogThrottled(conn.RemoteAddr().String(), port)
 			stats.throttled.Add(1)
@@ -437,9 +530,9 @@ func listenPort(
 	}
 }
 
-func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.Logger, stats *statsCounters, connSem chan struct{}) {
+func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.Logger, stats *statsCounters, conns *connectionTracker) {
 	defer conn.Close()
-	defer func() { <-connSem }() // release semaphore slot
+	defer conns.release() // frees the slot and marks this handler finished
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "  [!] panic in handleConnection: %v\n", r)
@@ -504,7 +597,7 @@ func showConflictAnalysis(pm *portscan.PortManager, ranges [][2]int, cfg *config
 			switch {
 			case used[p]:
 				excludedBySystem = append(excludedBySystem, p)
-			case contains(cfg.Ports.Exclude, p):
+			case slices.Contains(cfg.Ports.Exclude, p):
 				excludedByConfig = append(excludedByConfig, p)
 			case portscan.IsEphemeral(p, ephLo, ephHi):
 				excludedByEphemeral = append(excludedByEphemeral, p)
@@ -541,15 +634,6 @@ func showPortSummary(ports []int) {
 		fmt.Fprintf(os.Stderr, "  %s\n", formatPortList(show))
 	}
 	fmt.Fprintln(os.Stderr, "  ─────────────────────────────────────────────────────────")
-}
-
-func contains(slice []int, val int) bool {
-	for _, v := range slice {
-		if v == val {
-			return true
-		}
-	}
-	return false
 }
 
 func truncate(s string, maxRunes int) string {
