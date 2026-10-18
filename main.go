@@ -90,23 +90,64 @@ func (s *statsCounters) snapshot() (connections, payloads, errs, throttled int64
 type connectionTracker struct {
 	sem chan struct{}
 	wg  sync.WaitGroup
+
+	// Memory accounting (G3). Each handler reserves a fixed estimate of its
+	// peak footprint: the read buffer, the hex string (2x), the JSON line
+	// (2x) and slack. The slot count alone is derived from the fd limit,
+	// which says nothing about memory -- 4096 slots x ~0.45 MB for a 64 KB
+	// payload is far beyond the 128 MB systemd cap.
+	byteBudget  int64
+	reservation int64
+	bytesInUse  atomic.Int64
 }
 
-func newConnectionTracker(maxConcurrent int) *connectionTracker {
+type trackerOption func(*connectionTracker)
+
+// withByteBudget caps in-flight handlers by estimated memory. Non-positive
+// values leave the tracker unbounded, which is what the unit tests use.
+func withByteBudget(budget, reservation int64) trackerOption {
+	return func(t *connectionTracker) {
+		if budget > 0 && reservation > 0 {
+			t.byteBudget = budget
+			t.reservation = reservation
+		}
+	}
+}
+
+func newConnectionTracker(maxConcurrent int, opts ...trackerOption) *connectionTracker {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
-	return &connectionTracker{sem: make(chan struct{}, maxConcurrent)}
+	t := &connectionTracker{sem: make(chan struct{}, maxConcurrent)}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
 // acquire reserves a handler slot without blocking. It reports false when the
 // tracker is at capacity, in which case the caller must close the connection.
 func (t *connectionTracker) acquire() bool {
+	if t.byteBudget > 0 {
+		for {
+			used := t.bytesInUse.Load()
+			if used+t.reservation > t.byteBudget {
+				return false
+			}
+			if t.bytesInUse.CompareAndSwap(used, used+t.reservation) {
+				break
+			}
+		}
+	}
+
 	select {
 	case t.sem <- struct{}{}:
 		t.wg.Add(1)
 		return true
 	default:
+		if t.byteBudget > 0 {
+			t.bytesInUse.Add(-t.reservation)
+		}
 		return false
 	}
 }
@@ -114,6 +155,9 @@ func (t *connectionTracker) acquire() bool {
 // release frees a slot reserved by acquire and marks the handler finished.
 func (t *connectionTracker) release() {
 	<-t.sem
+	if t.byteBudget > 0 {
+		t.bytesInUse.Add(-t.reservation)
+	}
 	t.wg.Done()
 }
 
@@ -331,6 +375,7 @@ type app struct {
 	targets []int
 	stats   statsCounters
 	conns   *connectionTracker
+	fair    *fairnessLimiter
 	hits    *hitReporter
 }
 
@@ -347,10 +392,24 @@ func newApp(cfg *config.Config, ranges [][2]int) (*app, []int) {
 		pm:      pm,
 		targets: targets,
 		// Connection limiter — prevents goroutine explosion under flood.
-		// Sized from the fd limit so a DoS cannot exhaust every descriptor.
-		conns: newConnectionTracker(maxConnections()),
-		hits:  newHitReporter(os.Stderr),
+		// Sized from the fd limit so a DoS cannot exhaust every descriptor,
+		// then bounded again by an estimated-memory budget (G3).
+		conns: newConnectionTracker(maxConnections(),
+			withByteBudget(int64(cfg.Limits.MemoryBudgetMB)<<20, handlerReservation(cfg))),
+		fair: newFairnessLimiter(cfg.Limits.MaxPerPort, cfg.Limits.MaxPerIP),
+		hits: newHitReporter(os.Stderr),
 	}, targets
+}
+
+// handlerReservation estimates the peak memory of one handler: the read
+// buffer, the hex string (2x payload), the JSON line (~2x again) and slack.
+// The floor keeps tiny payload configs from admitting absurd slot counts.
+func handlerReservation(cfg *config.Config) int64 {
+	r := int64(cfg.Capture.MaxPayloadSize) * 8
+	if r < 64<<10 {
+		r = 64 << 10
+	}
+	return r
 }
 
 // portRanges flattens the configured port ranges into pairs.
@@ -476,7 +535,7 @@ func (a *app) startListeners(ctx context.Context) *sync.WaitGroup {
 		listeners.Add(1)
 		go func() {
 			defer listeners.Done()
-			err := listenPort(ctx, p, a.cfg, a.pm, a.log, a.secLog, &a.stats, a.conns, a.hits)
+			err := listenPort(ctx, p, a.cfg, a.pm, a.log, a.secLog, &a.stats, a.conns, a.hits, a.fair)
 			if err != nil && ctx.Err() == nil {
 				a.stats.errors.Add(1)
 			}
@@ -598,6 +657,7 @@ func listenPort(
 	stats *statsCounters,
 	conns *connectionTracker,
 	hits *hitReporter,
+	fair *fairnessLimiter,
 ) error {
 	addr := listenAddress(port)
 
@@ -712,13 +772,29 @@ func listenPort(
 
 		stats.connections.Add(1)
 
+		// Fairness first: one flooded port or sender must not take every
+		// slot. The reservation is released on every path, including when
+		// the global tracker rejects the connection.
+		remote := conn.RemoteAddr().String()
+		ip, _, _ := net.SplitHostPort(remote)
+		if !fair.tryAcquire(port, ip) {
+			secLog.LogThrottled(remote, port)
+			stats.throttled.Add(1)
+			conn.Close()
+			continue
+		}
+
 		// Try to acquire a handler slot (non-blocking).
 		// If at capacity, close immediately to prevent goroutine explosion.
 		if conns.acquire() {
-			go handleConnection(conn, port, cfg, log, stats, conns, hits)
+			go func(c net.Conn) {
+				defer fair.release(port, ip)
+				handleConnection(c, port, cfg, log, stats, conns, hits)
+			}(conn)
 		} else {
+			fair.release(port, ip)
 			// At capacity — close immediately, log throttle event
-			secLog.LogThrottled(conn.RemoteAddr().String(), port)
+			secLog.LogThrottled(remote, port)
 			stats.throttled.Add(1)
 			conn.Close()
 		}

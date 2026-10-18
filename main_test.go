@@ -81,7 +81,7 @@ func TestAcceptLoop_CtxCancelDuringIdleAccept(t *testing.T) {
 	port := freeTCPPort(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- listenPort(ctx, port, cfg, pm, log, secLog, &stats, conns, newHitReporter(io.Discard))
+		done <- listenPort(ctx, port, cfg, pm, log, secLog, &stats, conns, newHitReporter(io.Discard), newFairnessLimiter(0, 0))
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -995,5 +995,107 @@ func TestAppDrain_WaitsForListeners(t *testing.T) {
 	a.drain(&listeners)
 	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
 		t.Fatalf("drain() returned in %v; it did not wait for listeners", elapsed)
+	}
+}
+
+// ── Resource limits (G3/G4) ───────────────────────────────────────────────
+
+func TestConnectionTracker_ByteBudget(t *testing.T) {
+	// Three reservations fit; the fourth is refused even though the
+	// semaphore has room for ten.
+	tr := newConnectionTracker(10, withByteBudget(300, 100))
+
+	for i := 0; i < 3; i++ {
+		if !tr.acquire() {
+			t.Fatalf("acquire %d rejected inside the byte budget", i)
+		}
+	}
+	if tr.acquire() {
+		t.Fatal("acquire succeeded past the byte budget")
+	}
+
+	tr.release()
+	if !tr.acquire() {
+		t.Fatal("release did not return the reservation")
+	}
+	tr.release()
+	tr.release()
+	tr.release()
+
+	if got := tr.bytesInUse.Load(); got != 0 {
+		t.Fatalf("bytesInUse = %d after releasing everything, want 0", got)
+	}
+}
+
+func TestConnectionTracker_ByteBudgetDoesNotLeakOnSemaphoreFull(t *testing.T) {
+	tr := newConnectionTracker(1, withByteBudget(1<<20, 100))
+	if !tr.acquire() {
+		t.Fatal("first acquire failed")
+	}
+	if tr.acquire() {
+		t.Fatal("second acquire should fail on the semaphore")
+	}
+	tr.release()
+	if got := tr.bytesInUse.Load(); got != 0 {
+		t.Fatalf("bytesInUse = %d, want 0 (failed acquire leaked a reservation)", got)
+	}
+}
+
+func TestFairnessLimiter_PerPortCap(t *testing.T) {
+	f := newFairnessLimiter(2, 0)
+
+	if !f.tryAcquire(8080, "203.0.113.1") || !f.tryAcquire(8080, "203.0.113.2") {
+		t.Fatal("first two connections to the port must be admitted")
+	}
+	if f.tryAcquire(8080, "203.0.113.3") {
+		t.Fatal("third connection to the same port must be rejected")
+	}
+	// Another port is unaffected.
+	if !f.tryAcquire(8081, "203.0.113.3") {
+		t.Fatal("a different port must still be admitted")
+	}
+
+	f.release(8080, "203.0.113.1")
+	if !f.tryAcquire(8080, "203.0.113.3") {
+		t.Fatal("release did not free a per-port slot")
+	}
+}
+
+func TestFairnessLimiter_PerIPCap(t *testing.T) {
+	f := newFairnessLimiter(0, 1)
+
+	if !f.tryAcquire(8080, "203.0.113.9") {
+		t.Fatal("first connection from the IP must be admitted")
+	}
+	if f.tryAcquire(8081, "203.0.113.9") {
+		t.Fatal("second connection from the same IP must be rejected")
+	}
+	if !f.tryAcquire(8080, "203.0.113.10") {
+		t.Fatal("a different IP must still be admitted")
+	}
+
+	f.release(8080, "203.0.113.9")
+	if !f.tryAcquire(8081, "203.0.113.9") {
+		t.Fatal("release did not free a per-IP slot")
+	}
+}
+
+func TestFairnessLimiter_ZeroCapsAreUnlimited(t *testing.T) {
+	f := newFairnessLimiter(0, 0)
+	for i := 0; i < 100; i++ {
+		if !f.tryAcquire(8080, "203.0.113.9") {
+			t.Fatal("zero caps must not limit")
+		}
+	}
+}
+
+func TestHandlerReservationScalesWithPayload(t *testing.T) {
+	small := handlerReservation(&config.Config{Capture: config.CaptureConfig{MaxPayloadSize: 1024}})
+	if small != 64<<10 {
+		t.Fatalf("small payload reservation = %d, want the 64 KiB floor", small)
+	}
+	large := handlerReservation(&config.Config{Capture: config.CaptureConfig{MaxPayloadSize: 65536}})
+	if large != 65536*8 {
+		t.Fatalf("64 KiB payload reservation = %d, want %d", large, 65536*8)
 	}
 }

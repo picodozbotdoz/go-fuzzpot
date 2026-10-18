@@ -14,6 +14,7 @@ type Config struct {
 	Capture CaptureConfig `yaml:"capture"`
 	Logging LoggingConfig `yaml:"logging"`
 	Refresh RefreshConfig `yaml:"refresh"`
+	Limits  LimitsConfig  `yaml:"limits"`
 }
 
 type PortsConfig struct {
@@ -50,6 +51,19 @@ type RefreshConfig struct {
 	IntervalSec int `yaml:"interval_sec"`
 }
 
+// LimitsConfig bounds the resources an attacker can make the sensor hold.
+// Zero values fall back to the defaults set in DefaultConfig.
+type LimitsConfig struct {
+	// MemoryBudgetMB caps the estimated in-flight handler footprint (read
+	// buffer + hex + JSON line). Slots are granted only while the estimate
+	// fits, so the process stays below the systemd MemoryMax.
+	MemoryBudgetMB int `yaml:"memory_budget_mb"`
+	// MaxPerPort / MaxPerIP stop one flooded port or one sender from
+	// occupying every slot.
+	MaxPerPort int `yaml:"max_concurrent_per_port"`
+	MaxPerIP   int `yaml:"max_concurrent_per_ip"`
+}
+
 func DefaultConfig() Config {
 	return Config{
 		Ports: PortsConfig{
@@ -75,6 +89,11 @@ func DefaultConfig() Config {
 		},
 		Refresh: RefreshConfig{
 			IntervalSec: 60,
+		},
+		Limits: LimitsConfig{
+			MemoryBudgetMB: 64,
+			MaxPerPort:     64,
+			MaxPerIP:       32,
 		},
 	}
 }
