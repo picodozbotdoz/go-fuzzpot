@@ -871,6 +871,20 @@ func listenPort(
 	listener, err := bindListener()
 	stats.bindAttempts.Add(1) // first attempt done, whatever it returned (G9)
 	if err != nil {
+		// A privileged port on a unit that drops every capability fails with
+		// EACCES, which otherwise reads like a port conflict. Say what it is.
+		if port < 1024 && errors.Is(err, os.ErrPermission) {
+			fmt.Fprintf(os.Stderr,
+				"  [!] port %d: permission denied — ports below 1024 need CAP_NET_BIND_SERVICE "+
+					"(see AmbientCapabilities in fuzzpot.service)\n", port)
+			slogLogger.Error("listener_failed",
+				"port", port,
+				"error", err.Error(),
+				"action", "skip_port",
+				"hint", "privileged port requires CAP_NET_BIND_SERVICE",
+			)
+			return fmt.Errorf("port %d: %w", port, err)
+		}
 		slogLogger.Error("listener_failed",
 			"port", port,
 			"error", err.Error(),

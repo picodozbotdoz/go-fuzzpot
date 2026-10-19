@@ -172,6 +172,12 @@ The service runs under a strict sandbox:
 - `SystemCallFilter=@system-service ~@privileged` — dangerous syscalls blocked
 - `LockPersonality=true`, `RemoveIPC=true`
 
+Because every capability is dropped, a port range that includes ports below
+1024 needs an opt-in. Add `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
+`CapabilityBoundingSet=CAP_NET_BIND_SERVICE` to the unit; without it the
+listener fails with `EACCES` and the binary logs
+`hint=privileged port requires CAP_NET_BIND_SERVICE`.
+
 ## Log Format
 
 Each captured payload is one JSON line:

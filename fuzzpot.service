@@ -46,7 +46,12 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 SystemCallErrorNumber=EPERM
 
-# CapabilityBoundingSet: drop ALL capabilities
+# CapabilityBoundingSet: drop ALL capabilities.
+# The shipped port ranges (2000-5000, 8000-9000) are unprivileged, so nothing
+# is needed. If you add a range below 1024, binding it requires
+# CAP_NET_BIND_SERVICE — replace the two lines below with:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=
 
 # RestrictAddressFamilies: TCP only (no Unix sockets, no raw)
