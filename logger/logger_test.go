@@ -628,3 +628,53 @@ func BenchmarkLoggerRotations(b *testing.B) {
 		}
 	}
 }
+
+// D-17: a copy fallback that fails part-way must leave the original log
+// intact. The old rollback renamed the partial copy over it.
+func TestRotateCopyFailureKeepsTheOriginal(t *testing.T) {
+	dir := t.TempDir()
+	l, err := New(dir, "payloads.log", 1, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	original := strings.Repeat(`{"v":3,"size":4}`+"\n", 100)
+	if err := l.WriteRaw(strings.TrimSuffix(original, "\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	rename, cp := renameFile, copyThenTruncateFile
+	t.Cleanup(func() { renameFile, copyThenTruncateFile = rename, cp })
+	logPath := filepath.Join(dir, "payloads.log")
+	renameFile = func(oldpath, newpath string) error {
+		if oldpath == logPath {
+			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: os.ErrPermission}
+		}
+		return rename(oldpath, newpath)
+	}
+	copyThenTruncateFile = func(src, dst string) error {
+		// Half the data reaches the copy, then the disk fills up.
+		if err := os.WriteFile(dst, []byte(original[:len(original)/2]), 0640); err != nil {
+			return err
+		}
+		return fmt.Errorf("write %s: no space left on device", dst)
+	}
+
+	if err := l.rotate(); err == nil {
+		t.Fatal("rotate() reported success although nothing was moved aside")
+	}
+
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Fatalf("original log replaced: %d bytes left, want %d", len(got), len(original))
+	}
+	if left, _ := filepath.Glob(logPath + ".*"); len(left) != 0 {
+		t.Fatalf("partial copy left behind: %v", left)
+	}
+	if err := l.WriteRaw("after"); err != nil {
+		t.Fatalf("logger unusable after the failed rotation: %v", err)
+	}
+}

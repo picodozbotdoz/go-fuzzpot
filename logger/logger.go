@@ -187,6 +187,13 @@ func uniqueRotatedPath(logPath string) string {
 	}
 }
 
+// Indirections for rotation's filesystem moves, so tests can inject the
+// failures the copy fallback and its rollback exist for.
+var (
+	renameFile           = os.Rename
+	copyThenTruncateFile = copyThenTruncate
+)
+
 // rotate moves the current log aside and opens a fresh one.
 //
 // Rotation is rename-based (A1-7): os.Rename is atomic and O(1), so the
@@ -200,12 +207,17 @@ func (l *Logger) rotate() error {
 
 	l.file.Close()
 
-	if err := os.Rename(l.logPath, oldPath); err != nil {
+	if err := renameFile(l.logPath, oldPath); err != nil {
 		// Cross-device safe fallback: copy then truncate
-		if cerr := copyThenTruncate(l.logPath, oldPath); cerr != nil {
+		if cerr := copyThenTruncateFile(l.logPath, oldPath); cerr != nil {
 			// Could not move the data aside; reopen and keep writing to
 			// the original file rather than losing the log entirely.
-			os.Rename(oldPath, l.logPath) // roll back a partial copy
+			// copyThenTruncate only truncates after a complete copy, so the
+			// original is intact here and the copy is the thing to discard.
+			// D-17: the old rollback renamed the copy over the original,
+			// which replaced the log with a partial copy after a mid-copy
+			// failure (ENOSPC).
+			os.Remove(oldPath)
 			if f, rerr := os.OpenFile(l.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640); rerr == nil {
 				l.file = f
 				return fmt.Errorf("rotate: %w (copy fallback: %v)", err, cerr)
