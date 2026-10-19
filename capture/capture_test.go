@@ -386,7 +386,12 @@ func TestCapture_TimestampIsFirstByteNotCompletion(t *testing.T) {
 
 	completion := time.Now()
 	age := completion.Sub(event.Timestamp)
-	if age < drip {
-		t.Errorf("Timestamp is completion time (age %v < drip %v); want it stamped at the first byte (G6)", age, drip)
+	// A first-byte stamp is about one drip old here and a completion stamp is
+	// about zero, so half a drip separates them. D-19: comparing against the
+	// full drip flaked (249.86 ms < 250 ms): the sender sleeps after its first
+	// write returns, and timers are coarse, so the measured gap can come up
+	// a fraction of a millisecond short.
+	if age < drip/2 {
+		t.Errorf("Timestamp is completion time (age %v < half the drip, %v); want it stamped at the first byte (G6)", age, drip/2)
 	}
 }
