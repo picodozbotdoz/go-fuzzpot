@@ -13,76 +13,91 @@ func init() {
 	GetUsedPorts = getUsedPortsWindows
 }
 
-// getUsedPortsWindows uses netstat to find TCP LISTEN ports on Windows.
+// getUsedPortsWindows uses netstat to find listening TCP ports on Windows.
+//
+// D-20: `-p tcp` lists IPv4 sockets only, so an IPv6-only listener was
+// missed; both protocols are queried now.
 func getUsedPortsWindows() map[int]bool {
 	used := make(map[int]bool)
-
-	out, err := exec.Command("netstat", "-an", "-p", "tcp").Output()
-	if err != nil {
-		// Try without -p flag (older Windows)
-		out, err = exec.Command("netstat", "-an").Output()
+	queried := false
+	for _, proto := range []string{"tcp", "tcpv6"} {
+		out, err := exec.Command("netstat", "-an", "-p", proto).Output()
 		if err != nil {
-			return used
-		}
-	}
-
-	sc := bufio.NewScanner(strings.NewReader(string(out)))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
 			continue
 		}
-		// Check for LISTENING state
-		isListening := false
-		if len(fields) >= 4 {
-			state := strings.ToUpper(fields[3])
-			if state == "LISTENING" {
-				isListening = true
-			}
-		}
-		if !isListening {
-			continue
-		}
-		// Local address field: 0.0.0.0:80 or [::]:80
-		localAddr := fields[1]
-		if port := parseAddrPort(localAddr); port > 0 {
-			used[port] = true
+		queried = true
+		parseNetstatListening(string(out), used)
+	}
+	if !queried {
+		// Older Windows without -p: one combined listing.
+		if out, err := exec.Command("netstat", "-an").Output(); err == nil {
+			parseNetstatListening(string(out), used)
 		}
 	}
-
 	return used
 }
 
-// EphemeralRange returns sensible defaults for Windows.
-// Windows dynamic port range is typically 49152-65535 (Vista+)
-// or 1025-5000 (XP/2003).
-func EphemeralRange() (int, int, error) {
-	// Try to read via netsh
-	out, err := exec.Command("netsh", "int", "ipv4", "show", "dynamicport", "tcp").Output()
-	if err == nil {
-		sc := bufio.NewScanner(strings.NewReader(string(out)))
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if strings.Contains(line, "Start Port") {
-				if p, err := parseNetshValue(line); err == nil {
-					return p, 65535, nil
-				}
-			}
+// parseNetstatListening adds the local port of every listening TCP socket
+// in `netstat -an` output to used.
+//
+// D-20: a listening row is recognised by its wildcard foreign address
+// ("0.0.0.0:0", "[::]:0") as well as by the state column, because Windows
+// localises that column ("LISTENING", "ABHÖREN", ...).
+func parseNetstatListening(out string, used map[int]bool) {
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 4 || !strings.EqualFold(fields[0], "TCP") {
+			continue
+		}
+		foreign := fields[2]
+		if foreign != "0.0.0.0:0" && foreign != "[::]:0" && !strings.EqualFold(fields[3], "LISTENING") {
+			continue
+		}
+		if port := parseAddrPort(fields[1]); port > 0 {
+			used[port] = true
 		}
 	}
-	// Default Windows Vista+
+}
+
+// EphemeralRange returns the TCP dynamic port range reported by netsh, or
+// the Vista+ default 49152-65535 when it cannot be read.
+func EphemeralRange() (int, int, error) {
+	out, err := exec.Command("netsh", "int", "ipv4", "show", "dynamicport", "tcp").Output()
+	if err == nil {
+		if lo, hi, ok := parseDynamicPortRange(string(out)); ok {
+			return lo, hi, nil
+		}
+	}
 	return 49152, 65535, nil
 }
 
-func parseNetshValue(line string) (int, error) {
-	// netsh prints "Start Port      : 49152" — the value is the LAST
-	// whitespace-separated token; fields[2] was the ":" separator, so
-	// Atoi always failed and the detection was dead code falling back to
-	// the hardcoded 49152-65535 (R2-G5).
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
-		return 0, strconv.ErrSyntax
+// parseDynamicPortRange reads netsh's "Start Port : N" and
+// "Number of Ports : M" lines and returns N and N+M-1.
+//
+// D-20: the end used to be hardcoded to 65535, which is only right for the
+// default range. Values are taken positionally (the first two "label : number"
+// lines) because the labels are localised.
+func parseDynamicPortRange(out string) (int, int, bool) {
+	var nums []int
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() && len(nums) < 2 {
+		line := sc.Text()
+		i := strings.LastIndex(line, ":")
+		if i < 0 {
+			continue
+		}
+		if v, err := strconv.Atoi(strings.TrimSpace(line[i+1:])); err == nil {
+			nums = append(nums, v)
+		}
 	}
-	return strconv.Atoi(fields[len(fields)-1])
+	if len(nums) < 2 {
+		return 0, 0, false
+	}
+	lo, count := nums[0], nums[1]
+	hi := lo + count - 1
+	if lo < 1 || count < 1 || hi > 65535 {
+		return 0, 0, false
+	}
+	return lo, hi, true
 }
