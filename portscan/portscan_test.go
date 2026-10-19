@@ -82,22 +82,6 @@ func TestPortManager_DetectConflicts(t *testing.T) {
 	}
 }
 
-func TestPortManager_RefreshEphemeralRange(t *testing.T) {
-	pm := NewPortManager(nil)
-	originalLo, originalHi := pm.ephLo, pm.ephHi
-
-	// On non-linux, EphemeralRange returns defaults, so just verify no panic
-	pm.RefreshEphemeralRange()
-
-	// Should still be valid range
-	if pm.ephLo > pm.ephHi {
-		t.Errorf("RefreshEphemeralRange() produced invalid range: %d-%d", pm.ephLo, pm.ephHi)
-	}
-
-	// Restore for other tests
-	pm.ephLo, pm.ephHi = originalLo, originalHi
-}
-
 func TestIsEphemeral_Boundaries(t *testing.T) {
 	tests := []struct {
 		port, lo, hi int

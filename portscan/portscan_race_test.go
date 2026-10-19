@@ -42,15 +42,6 @@ func TestTargetPorts_RaceCondition(t *testing.T) {
 		}
 	}()
 
-	// Goroutine 3: refresh ephemeral range
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 50; i++ {
-			pm.RefreshEphemeralRange()
-		}
-	}()
-
 	wg.Wait()
 	// If race detector is enabled, this test will fail if races exist
 }

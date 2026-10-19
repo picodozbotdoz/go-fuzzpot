@@ -756,12 +756,11 @@ func (a *app) drain(listeners *sync.WaitGroup) {
 // It deliberately does not diff the system socket table: that table contains
 // our own listeners, so the old comparison reported every bound port on every
 // tick and rolled security.log within hours.
+//
+// D-18: it used to refresh the ephemeral range first, but only TargetPorts
+// reads that range, and it runs once at start-up. The refresh changed
+// nothing and spawned netsh on every tick on Windows.
 func (a *app) checkConflicts() {
-	// G13: the ephemeral range can change at runtime (e.g. a widened
-	// sysctl); the ticker exists for exactly this refresh, but nothing
-	// ever called it.
-	a.pm.RefreshEphemeralRange()
-
 	conflicts := a.pm.DetectConflicts()
 	if len(conflicts) == 0 {
 		return

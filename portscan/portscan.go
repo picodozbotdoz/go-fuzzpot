@@ -134,13 +134,6 @@ func (pm *PortManager) DetectConflicts() []int {
 	return ports
 }
 
-// RefreshEphemeralRange re-reads the ephemeral range from the platform.
-func (pm *PortManager) RefreshEphemeralRange() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.ephLo, pm.ephHi, _ = EphemeralRange()
-}
-
 // parseAddrPort extracts the port from a local-address string as reported
 // by the platform tools. One shared implementation for every OS variant
 // (G13 — freebsd and windows each carried a private copy):
