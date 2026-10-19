@@ -41,11 +41,16 @@ jobs:
         run: go vet ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # golangci-lint v1.61 was built with Go 1.23 and refuses to analyse a
+        # module that targets go 1.25 ("the Go language version used to build
+        # golangci-lint is lower than the targeted Go version"), so the lint
+        # job was red before it ever looked at the code. v2 also renamed
+        # --disable-all to --default=none.
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.61
+          version: v2.15.0
           # Start permissive; tighten in week 5 of the upgrade plan.
-          args: --timeout=5m --disable-all -E govet,errcheck,staticcheck,ineffassign,unused,gocritic
+          args: --timeout=5m --default=none -E govet,errcheck,staticcheck,ineffassign,unused,gocritic
 
   test:
     name: Test (${{ matrix.os }})
