@@ -52,6 +52,33 @@ jobs:
           # Start permissive; tighten in week 5 of the upgrade plan.
           args: --timeout=5m --default=none -E govet,errcheck,staticcheck,ineffassign,unused,gocritic
 
+  cross-vet:
+    # portscan/ is split by build tag; the freebsd and fallback variants have
+    # no runner, so the test lanes never compile them. Vetting each GOOS
+    # catches a shared-API change that only one variant forgot (D-15a).
+    # -race cannot run cross-OS; the linux variant is raced in `test`.
+    name: Vet (${{ matrix.goos }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [freebsd, darwin, windows]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      # go vet type-checks _test.go files too, so this covers the tagged tests.
+      - name: go vet + build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go build -o /dev/null .
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
