@@ -1604,3 +1604,26 @@ func TestHandlerCapReservesListenerDescriptors(t *testing.T) {
 		t.Errorf("handlers (%d) + listeners exceed the limit", got)
 	}
 }
+
+// ── D-22: reopenLogs skips a logger that is not attached ───────────────────
+
+func TestReopenLogsSkipsAnUnattachedLogger(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	log, err := logger.New(t.TempDir(), "reopen.log", 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	a := &app{log: log} // secLog not attached: a typed nil inside the interface map
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("reopenLogs panicked on an unattached security logger: %v", r)
+		}
+	}()
+	a.reopenLogs()
+
+	if err := log.WriteRaw("after reopen"); err != nil {
+		t.Fatalf("payload log unusable after reopen: %v", err)
+	}
+}

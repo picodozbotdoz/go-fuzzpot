@@ -576,12 +576,22 @@ func (a *app) watchSignals(sigCh <-chan os.Signal, cancel context.CancelFunc) {
 // logged but not fatal: the next SIGHUP retries, and the old descriptor
 // keeps receiving writes where that is still possible.
 func (a *app) reopenLogs() {
-	for name, l := range map[string]interface {
-		Reopen() error
-	}{"payload_log": a.log, "security_log": a.secLog} {
-		if l == nil {
-			continue
-		}
+	// D-22: the nil check must happen on the concrete pointers. Stored in an
+	// interface, a nil *SecurityLogger is a non-nil value, and calling
+	// Reopen on it panicked. A slice also fixes the reopen order.
+	type namedLog struct {
+		name string
+		l    interface{ Reopen() error }
+	}
+	var logs []namedLog
+	if a.log != nil {
+		logs = append(logs, namedLog{"payload_log", a.log})
+	}
+	if a.secLog != nil {
+		logs = append(logs, namedLog{"security_log", a.secLog})
+	}
+	for _, entry := range logs {
+		name, l := entry.name, entry.l
 		if err := l.Reopen(); err != nil {
 			fmt.Fprintf(os.Stderr, "  [!] reopen %s failed: %v\n", name, err)
 			slogLogger.Error("log_reopen_failed",
