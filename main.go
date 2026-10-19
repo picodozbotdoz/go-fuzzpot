@@ -47,8 +47,9 @@ var (
 // LogEntry's `v` field (B1-8). v1 = the original field set plus `v`
 // itself; consumers treat a missing `v` as pre-versioning v1.
 // v2 adds the optional `truncated` flag (G5) and first-byte `ts` with
-// sub-second precision (G6).
-const logSchemaVersion = 2
+// sub-second precision (G6). v3 adds the `sensor` instance identity
+// (A2-12), so one analyzer can tell several honeypots apart.
+const logSchemaVersion = 3
 
 // LogEntry is a typed struct for JSON log serialization.
 // Using json.Marshal on a struct ensures proper escaping of all special
@@ -58,8 +59,9 @@ const logSchemaVersion = 2
 // adds the field itself on top of the original schema; consumers must
 // treat a missing `v` as the pre-versioning format (field-compatible
 // with v1). v2 adds `truncated` (omitted when false) and switches `ts`
-// to first-byte time at RFC3339Nano precision. The contract is validated
-// in both fuzzpot and fuzz-sec-intel (contract/contract_test.go ↔
+// to first-byte time at RFC3339Nano precision. v3 adds `sensor`
+// (config sensor.name, defaulting to the hostname). The contract is
+// validated in both fuzzpot and fuzz-sec-intel (contract/contract_test.go ↔
 // tests/test_contract.py).
 type LogEntry struct {
 	V             int    `json:"v"`
@@ -73,6 +75,7 @@ type LogEntry struct {
 	Hex           string `json:"hex,omitempty"`
 	PayloadSHA256 string `json:"payload_sha256,omitempty"` // SHA256 hash for threat intel
 	Truncated     bool   `json:"truncated,omitempty"`      // payload stopped at the cap (G5)
+	Sensor        string `json:"sensor,omitempty"`         // instance identity, always set since v3 (A2-12)
 }
 
 // statsCounters holds process-lifetime counters. All fields are atomic and
@@ -324,6 +327,7 @@ func realMain() int {
 		"version", version,
 		"config_path", *cfgPath,
 		"log_dir", cfg.Logging.Dir,
+		"sensor", cfg.Sensor.Name,
 		"read_timeout_sec", cfg.Capture.ReadTimeoutSec,
 		"refresh_interval_sec", cfg.Refresh.IntervalSec,
 	)
@@ -338,6 +342,7 @@ func realMain() int {
 	if len(targets) > 0 {
 		fmt.Fprintf(os.Stderr, "  [*] Range:            %d – %d\n", targets[0], targets[len(targets)-1])
 	}
+	fmt.Fprintf(os.Stderr, "  [*] Sensor:           %s\n", cfg.Sensor.Name)
 	fmt.Fprintf(os.Stderr, "  [*] Log file:         %s\n", cfg.LogPath())
 	fmt.Fprintf(os.Stderr, "  [*] Read timeout:     %ds\n", cfg.Capture.ReadTimeoutSec)
 	fmt.Fprintf(os.Stderr, "  [*] Refresh interval: %ds\n", cfg.Refresh.IntervalSec)
@@ -371,6 +376,7 @@ func realMain() int {
 		return 1
 	}
 	defer secLog.Close()
+	secLog.Sensor = cfg.Sensor.Name
 
 	a.log = log
 	a.secLog = secLog
@@ -1050,6 +1056,7 @@ func handleConnection(conn net.Conn, port int, cfg *config.Config, log *logger.L
 			Printable:     event.Printable, // json.Marshal will escape correctly
 			PayloadSHA256: event.PayloadSHA256,
 			Truncated:     event.Truncated, // omitted from JSON when false
+			Sensor:        cfg.Sensor.Name,
 		}
 
 		// Hex payload is large (~2x raw size); omit it when configured

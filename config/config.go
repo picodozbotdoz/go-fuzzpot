@@ -20,6 +20,28 @@ type Config struct {
 	Refresh RefreshConfig `yaml:"refresh"`
 	Limits  LimitsConfig  `yaml:"limits"`
 	Stats   StatsConfig   `yaml:"stats"`
+	Sensor  SensorConfig  `yaml:"sensor"`
+}
+
+// SensorConfig identifies this honeypot instance in every log line (A2-12),
+// so one analyzer can ingest several sensors and still tell them apart.
+type SensorConfig struct {
+	// Name is the `sensor` value written to payload and security logs.
+	// Empty (or absent) falls back to the hostname.
+	Name string `yaml:"name"`
+}
+
+// maxSensorNameLen bounds the per-line cost of the identity field; it is
+// the DNS name limit, so a hostname default always fits.
+const maxSensorNameLen = 253
+
+// defaultSensorName is the hostname, or "unknown" when the OS cannot
+// report one — every v3 line must carry a non-empty sensor.
+func defaultSensorName() string {
+	if h, err := os.Hostname(); err == nil && strings.TrimSpace(h) != "" {
+		return strings.TrimSpace(h)
+	}
+	return "unknown"
 }
 
 type StatsConfig struct {
@@ -109,6 +131,9 @@ func DefaultConfig() Config {
 		Stats: StatsConfig{
 			IntervalSec: 10,
 		},
+		Sensor: SensorConfig{
+			Name: defaultSensorName(),
+		},
 	}
 }
 
@@ -150,6 +175,11 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Limits.MaxPerIP <= 0 {
 		cfg.Limits.MaxPerIP = def.Limits.MaxPerIP
+	}
+	// A2-12: `name: ""` overwrites the seeded hostname the same way.
+	cfg.Sensor.Name = strings.TrimSpace(cfg.Sensor.Name)
+	if cfg.Sensor.Name == "" {
+		cfg.Sensor.Name = def.Sensor.Name
 	}
 
 	return &cfg, nil
@@ -211,6 +241,16 @@ func (c *Config) Validate() error {
 	if c.Logging.File == "" || c.Logging.File == "." || c.Logging.File == ".." ||
 		strings.ContainsAny(c.Logging.File, `/\`) {
 		return fmt.Errorf("logging.file must be a bare file name, got %q", c.Logging.File)
+	}
+	// A2-12: the analyzer groups and filters by sensor, so keep it a short
+	// printable token rather than free text.
+	if len(c.Sensor.Name) > maxSensorNameLen {
+		return fmt.Errorf("sensor.name must be at most %d bytes, got %d", maxSensorNameLen, len(c.Sensor.Name))
+	}
+	for _, r := range c.Sensor.Name {
+		if r <= ' ' || r > '~' {
+			return fmt.Errorf("sensor.name must be printable ASCII without spaces, got %q", c.Sensor.Name)
+		}
 	}
 	return nil
 }

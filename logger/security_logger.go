@@ -19,13 +19,16 @@ type SecurityEvent struct {
 	RemoteAddr string            `json:"remote_addr,omitempty"`
 	Port       int               `json:"port,omitempty"`
 	Ports      []int             `json:"ports,omitempty"`
-	Count      int               `json:"count,omitempty"` // aggregate events (G7)
+	Count      int               `json:"count,omitempty"`  // aggregate events (G7)
+	Sensor     string            `json:"sensor,omitempty"` // instance identity (A2-12)
 }
 
 // SecurityLogger wraps Logger for security-relevant events.
 // It writes to a separate security.log file for easier incident response monitoring.
 type SecurityLogger struct {
 	*Logger
+	// Sensor is stamped on every event (A2-12); set it before the first write.
+	Sensor string
 }
 
 // NewSecurityLogger creates a SecurityLogger that writes to security.log.
@@ -49,6 +52,7 @@ func (sl *SecurityLogger) LogThrottled(remoteAddr string, port int) {
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 		RemoteAddr: remoteAddr,
 		Port:       port,
+		Sensor:     sl.Sensor,
 	}
 	sl.WriteEventTyped(event)
 }
@@ -64,6 +68,7 @@ func (sl *SecurityLogger) LogThrottledBulk(count int) {
 		EventType: EventThrottled,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Count:     count,
+		Sensor:    sl.Sensor,
 	}
 	sl.WriteEventTyped(event)
 }
@@ -74,6 +79,7 @@ func (sl *SecurityLogger) LogConflict(ports []int) {
 		EventType: EventConflictDetect,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Ports:     ports,
+		Sensor:    sl.Sensor,
 	}
 	sl.WriteEventTyped(event)
 }

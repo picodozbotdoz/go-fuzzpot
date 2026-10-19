@@ -38,3 +38,9 @@ logging:
 
 refresh:
   interval_sec: 60  # re-scan /proc/net/tcp every 60 seconds
+
+# Instance identity written as `sensor` on every payload and security log
+# line (schema v3). Leave empty to use the hostname. Printable ASCII, no
+# spaces, at most 253 bytes.
+sensor:
+  name: ""

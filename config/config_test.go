@@ -338,3 +338,48 @@ func TestLoadEmptyFileUsesDefaults(t *testing.T) {
 		t.Errorf("defaults not applied for empty config: %+v", cfg.Capture)
 	}
 }
+
+// A2-12: sensor.name defaults to the hostname, an explicit empty value
+// falls back the same way, and a set value is kept (trimmed).
+func TestSensorNameDefaultsAndOverride(t *testing.T) {
+	def := DefaultConfig()
+	if def.Sensor.Name == "" {
+		t.Fatal("DefaultConfig sensor name is empty; v3 lines must carry a sensor")
+	}
+	if h, err := os.Hostname(); err == nil && h != "" && def.Sensor.Name != h {
+		t.Errorf("default sensor = %q, want hostname %q", def.Sensor.Name, h)
+	}
+
+	for _, tc := range []struct{ yaml, want string }{
+		{"sensor:\n  name: \"\"\n", def.Sensor.Name},
+		{"sensor:\n  name: \"  edge-sg-1 \"\n", "edge-sg-1"},
+		{"refresh:\n  interval_sec: 60\n", def.Sensor.Name},
+	} {
+		path := filepath.Join(t.TempDir(), "cfg.yaml")
+		if err := os.WriteFile(path, []byte(tc.yaml), 0640); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Sensor.Name != tc.want {
+			t.Errorf("yaml %q: sensor = %q, want %q", tc.yaml, cfg.Sensor.Name, tc.want)
+		}
+	}
+}
+
+func TestValidateRejectsBadSensorName(t *testing.T) {
+	for _, name := range []string{"has space", "tab\there", "nul\x00", "café", strings.Repeat("a", 254)} {
+		cfg := DefaultConfig()
+		cfg.Sensor.Name = name
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("sensor.name %q accepted, want error", name)
+		}
+	}
+	cfg := DefaultConfig()
+	cfg.Sensor.Name = "edge-sg-1.example.net"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid sensor.name rejected: %v", err)
+	}
+}

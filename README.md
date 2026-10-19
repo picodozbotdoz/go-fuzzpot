@@ -23,7 +23,7 @@ Every connection is logged as a JSON line with:
 
 | Field | Description |
 |---|---|
-| `v` | Schema version (`1` or `2`; lines from pre-versioning builds lack it and are v1-compatible) |
+| `v` | Schema version (`1`–`3`; lines from pre-versioning builds lack it and are v1-compatible) |
 | `ts` | Timestamp of the **first payload byte** (ISO 8601, sub-second precision since v2) |
 | `src_ip` | Attacker IP |
 | `src_port` | Attacker source port |
@@ -33,8 +33,11 @@ Every connection is logged as a JSON line with:
 | `printable` | Printable ASCII representation |
 | `hex` | Full hex dump of the payload |
 | `truncated` | v2 only: `true` when capture stopped at `max_payload_size` (more bytes may have followed; an exactly-cap-sized payload is also flagged). Omitted when `false` |
+| `sensor` | v3+: identity of the honeypot instance (`sensor.name` in the config, defaulting to the hostname). Always present since v3; also stamped on `security.log` events |
 
 **v2 changes (vs v1):** `size` is a hard cap (v1 could overshoot by one read chunk), `ts` is the first-byte time rather than capture completion, and `truncated` makes cap-truncation visible downstream.
+
+**v3 changes (vs v2):** every line carries `sensor`, so one fuzz-sec-intel instance can ingest several honeypots and filter or health-check them per sensor. Consumers treat v1/v2 lines (no `sensor`) as sensor `""`.
 
 The machine-readable schema lives in [`contract/log_schema.json`](contract/log_schema.json) and is validated by contract tests in both fuzzpot and [fuzz-sec-intel](https://github.com/picodozbotdoz/fuzz-sec-intel) — changes must land as coordinated commits in both repos.
 
@@ -135,6 +138,9 @@ logging:
 
 refresh:
   interval_sec: 60           # re-scan /proc/net/tcp for conflicts
+
+sensor:
+  name: edge-sg-1            # `sensor` in every log line; empty = hostname
 ```
 
 ### Port selection logic

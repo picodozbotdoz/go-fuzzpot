@@ -1,7 +1,7 @@
 package main
 
 // Contract test (B1-8): the fuzzpot JSONL log-line schema is shared with
-// fuzz-sec-intel. contract/log_schema.json and contract/sample_v1.jsonl
+// fuzz-sec-intel. contract/log_schema.json and contract/sample_v*.jsonl
 // are byte-identical in both repos; fuzz-sec-intel's tests/test_contract.py
 // validates the same files. Any change here must land as a coordinated
 // pair of commits in both repositories.
@@ -85,8 +85,21 @@ func validateLine(t *testing.T, rules schemaRules, line map[string]interface{}) 
 			t.Errorf("line has field %q not in schema properties: %v", key, line)
 		}
 	}
-	if v, ok := line["v"].(float64); !ok || (int(v) != 1 && int(v) != 2) {
-		t.Errorf("v = %v, want integer 1 or 2", line["v"])
+	v, ok := line["v"].(float64)
+	if !ok || v < 1 || v > logSchemaVersion || v != float64(int(v)) {
+		t.Errorf("v = %v, want integer in [1,%d]", line["v"], logSchemaVersion)
+	}
+	// sensor (A2-12): mandatory from v3, and a non-empty printable token
+	// whenever present.
+	sensor, hasSensor := line["sensor"]
+	if v >= 3 && !hasSensor {
+		t.Errorf("v%v line missing sensor: %v", v, line)
+	}
+	if hasSensor {
+		s, ok := sensor.(string)
+		if !ok || s == "" || len(s) > 253 || strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r > '~' }) {
+			t.Errorf("sensor = %q, want 1-253 printable ASCII bytes without spaces", sensor)
+		}
 	}
 	if trunc, present := line["truncated"]; present {
 		if _, ok := trunc.(bool); !ok {
@@ -221,7 +234,7 @@ func TestContractLogEntryConformsToV2(t *testing.T) {
 	rules := loadRules(t)
 
 	entry := LogEntry{
-		V:             logSchemaVersion,
+		V:             2,
 		Timestamp:     "2026-10-19T03:41:02.483921087Z",
 		SourceIP:      "45.148.10.87",
 		SourcePort:    51022,
@@ -246,8 +259,103 @@ func TestContractLogEntryConformsToV2(t *testing.T) {
 	}
 }
 
+// readFixture decodes and validates every line of a contract fixture.
+func readFixture(t *testing.T, rules schemaRules, name string) []map[string]interface{} {
+	t.Helper()
+	f, err := os.Open(filepath.Join("contract", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var lines []map[string]interface{}
+	for scanner.Scan() {
+		raw := strings.TrimSpace(scanner.Text())
+		if raw == "" {
+			continue
+		}
+		var line map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &line); err != nil {
+			t.Fatalf("fixture line is not valid JSON: %v", err)
+		}
+		validateLine(t, rules, line)
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// TestContractFixtureIsValidV3 checks the v3 sample: two sensors, one
+// truncated line. A2-12.
+func TestContractFixtureIsValidV3(t *testing.T) {
+	lines := readFixture(t, loadRules(t), "sample_v3.jsonl")
+	if len(lines) != 2 {
+		t.Fatalf("fixture has %d lines, want 2 (update both repos' fixtures together)", len(lines))
+	}
+	if lines[0]["sensor"] == lines[1]["sensor"] {
+		t.Errorf("v3 fixture should cover two distinct sensors, got %v twice", lines[0]["sensor"])
+	}
+	for i, line := range lines {
+		if line["v"] != float64(3) {
+			t.Errorf("line %d: v = %v, want 3", i, line["v"])
+		}
+	}
+}
+
+func TestContractLogEntryConformsToV3(t *testing.T) {
+	rules := loadRules(t)
+	entry := LogEntry{
+		V:             logSchemaVersion,
+		Timestamp:     "2026-10-19T08:12:45.000917Z",
+		SourceIP:      "185.220.101.42",
+		SourcePort:    40112,
+		DestPort:      2222,
+		Proto:         "tcp",
+		Size:          21,
+		Printable:     "SSH-2.0-libssh_0.9.6",
+		PayloadSHA256: strings.Repeat("ef", 32),
+		Sensor:        "edge-fra-2",
+	}
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var line map[string]interface{}
+	if err := json.Unmarshal(raw, &line); err != nil {
+		t.Fatal(err)
+	}
+	validateLine(t, rules, line)
+	if line["sensor"] != "edge-fra-2" {
+		t.Errorf("sensor = %v, want edge-fra-2", line["sensor"])
+	}
+}
+
+// The schema's `v` enum must list every version up to the constant, and
+// `sensor` must be declared — the Go struct and the JSON file move together.
+func TestContractSchemaDeclaresV3(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("contract", "log_schema.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Enum []any `json:"enum"` // proto's enum holds strings
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatal(err)
+	}
+	enum := schema.Properties["v"].Enum
+	if len(enum) != logSchemaVersion || enum[len(enum)-1] != float64(logSchemaVersion) {
+		t.Errorf("schema v enum = %v, want 1..%d", enum, logSchemaVersion)
+	}
+	if _, ok := schema.Properties["sensor"]; !ok {
+		t.Error("schema does not declare sensor (A2-12)")
+	}
+}
+
 func TestContractSchemaVersionConstant(t *testing.T) {
-	if logSchemaVersion != 2 {
+	if logSchemaVersion != 3 {
 		t.Errorf("logSchemaVersion = %d; bumping it requires coordinated schema + fixture updates in BOTH repo", logSchemaVersion)
 	}
 }

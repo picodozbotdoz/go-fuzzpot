@@ -26,7 +26,7 @@ Companion file: `repo/fuzz-sec-intel/docs/ROADMAP_1017.md` (sections B0–B4 + C
 
 ### A2 — Capability (purpose-aligned; each opt-in where noted)
 
-- [ ] **A2-12 `sensor` identity field** — config name + hostname in every `LogEntry` (main.go:36-46) and `SecurityEvent`. **Cross-repo: consumed by B4-22.**
+- [x] **A2-12 `sensor` identity field** — config name + hostname in every `LogEntry` (main.go:36-46) and `SecurityEvent`. **Cross-repo: consumed by B4-22.** ✅ 2026-10-19: `sensor.name` config (empty/absent → hostname, else `unknown`; validated printable ASCII, no spaces, ≤253 bytes) stamped as `sensor` on every `LogEntry` and `SecurityEvent`; `logSchemaVersion` 3; `contract/log_schema.json` declares `sensor` (optional in the schema so v1/v2 lines stay valid, mandatory for v3 in both contract suites) + `contract/sample_v3.jsonl` (two sensors), byte-identical in fuzz-sec-intel. Shown in the start-up banner and `fuzzpot_starting` slog line. Gates: `gofmt -l` empty, `go vet`, `go test ./...`, freebsd/darwin/linux vet.
 - [ ] **A2-13 UDP capture** — opt-in, default off: per-port UDP sockets with SO_RCVBUF, per-datagram events (`proto: "udp"`), `/proc/net/udp{,6}` conflict detection.
 - [ ] **A2-14 SIGHUP config reload** — reconciling the listener set (add/remove/rebind without dropping captures). Note: SIGHUP is currently unhandled → terminates the process.
 - [ ] **A2-15 Raw payload artifact capture** — opt-in, default off: raw bytes to a daily spool dir for analyzer replay; JSONL stays the primary contract.
@@ -79,3 +79,4 @@ _(record capture/sec numbers per release here as A3-16 lands)_
 - 2026-10-18 (review): appended D-2..D-12 from `outputs/engineering/PROJECT_REVIEW_2026-10-18.md`; marked A1-11 invalid as written (superseded by D-2) and A1-6 closable via D-3. No items deleted.
 - 2026-10-19 (run-3): ticked A1-6 (D-3 shipped it); appended D-13 (throttle double-count, fixed), D-14 (CI linter, fixed), D-15 (CI/unit gaps, open). Verification: `gofmt -l` empty, `go vet` clean, `go test ./...` green, four cross-builds OK, `--dry-run` exit 0.
 - 2026-10-19 (close-out): ticked D-15 (`7d8255b` + cross-vet CI job).
+- 2026-10-19: ticked A2-12 (schema v3 `sensor`), landed together with fuzz-sec-intel B4-22.

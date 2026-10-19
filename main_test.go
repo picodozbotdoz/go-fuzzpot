@@ -489,6 +489,7 @@ func TestEndToEnd_LogHexPayloadDisabled(t *testing.T) {
 			MaxPayloadSize: 65536,
 			LogHexPayload:  false,
 		},
+		Sensor: config.SensorConfig{Name: "edge-test-1"},
 	}
 
 	var stats statsCounters
@@ -550,6 +551,10 @@ func TestEndToEnd_LogHexPayloadDisabled(t *testing.T) {
 	}
 	if entry.PayloadSHA256 == "" {
 		t.Error("PayloadSHA256 should still be present even without Hex")
+	}
+	// A2-12: every line carries the configured sensor at schema v3.
+	if entry.Sensor != "edge-test-1" || entry.V != logSchemaVersion {
+		t.Errorf("sensor/v = %q/%d, want edge-test-1/%d", entry.Sensor, entry.V, logSchemaVersion)
 	}
 
 	cancel()
@@ -1219,6 +1224,7 @@ func TestLogThrottledBulkAggregates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sl.Close()
+	sl.Sensor = "edge-test-1"
 
 	sl.LogThrottledBulk(500)
 	sl.LogThrottledBulk(0) // no-op, must not emit
@@ -1230,6 +1236,9 @@ func TestLogThrottledBulkAggregates(t *testing.T) {
 	content := string(data)
 	if !strings.Contains(content, `"count":500`) {
 		t.Errorf("aggregate event missing count=500: %s", content)
+	}
+	if !strings.Contains(content, `"sensor":"edge-test-1"`) {
+		t.Errorf("security event missing sensor (A2-12): %s", content)
 	}
 	if strings.Count(content, "connection_throttled") != 1 {
 		t.Errorf("want exactly one aggregated event, got: %s", content)
@@ -1390,8 +1399,8 @@ func TestTwoPortLoopbackSmoke(t *testing.T) {
 		}
 		gotPorts[e.DestPort] = true
 
-		if e.V != 2 {
-			t.Errorf("v = %d, want 2 (schema version)", e.V)
+		if e.V != logSchemaVersion {
+			t.Errorf("v = %d, want %d (schema version)", e.V, logSchemaVersion)
 		}
 		if _, terr := time.Parse(time.RFC3339Nano, e.Timestamp); terr != nil {
 			t.Errorf("ts %q is not RFC3339Nano: %v", e.Timestamp, terr)
