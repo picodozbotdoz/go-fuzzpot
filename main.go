@@ -557,6 +557,12 @@ func (a *app) run(ctx context.Context) error {
 		return errors.New("app: loggers must be attached before run")
 	}
 
+	// Listeners whose initial bind failed keep retrying until ctx ends
+	// (D-16); run cancels its own child context when it gives up early, so
+	// drain does not wait out the grace period on them.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	statsWriter := time.NewTicker(a.cfg.StatsInterval()) // configurable tick (G12)
 	defer statsWriter.Stop()
 	go a.reportStats(ctx, statsWriter)
@@ -580,12 +586,14 @@ func (a *app) run(ctx context.Context) error {
 	}
 	if bound == 0 && targets > 0 {
 		// Drain anyway: a listener that bound between the count and this
-		// check can still have an in-flight handler.
+		// check can still have an in-flight handler. Cancel first, or the
+		// retrying listeners never return.
+		cancel()
 		a.drain(listeners)
 		return fmt.Errorf("no ports could be bound (0 of %d targets)", targets)
 	}
 	if bound < targets {
-		fmt.Fprintf(os.Stderr, "  [!] Partial bind: %d of %d target ports held; failed ports are retried by the rebind loop\n",
+		fmt.Fprintf(os.Stderr, "  [!] Partial bind: %d of %d target ports held; the others are retried in the background\n",
 			bound, targets)
 		slogLogger.Warn("partial_bind",
 			"bound_ports", bound,
@@ -877,6 +885,7 @@ func listenPort(
 	listener, err := bindListener()
 	stats.bindAttempts.Add(1) // first attempt done, whatever it returned (G9)
 	if err != nil {
+		stats.errors.Add(1)
 		// A privileged port on a unit that drops every capability fails with
 		// EACCES, which otherwise reads like a port conflict. Say what it is.
 		if port < 1024 && errors.Is(err, os.ErrPermission) {
@@ -886,17 +895,30 @@ func listenPort(
 			slogLogger.Error("listener_failed",
 				"port", port,
 				"error", err.Error(),
-				"action", "skip_port",
+				"action", "retry",
 				"hint", "privileged port requires CAP_NET_BIND_SERVICE",
 			)
-			return fmt.Errorf("port %d: %w", port, err)
+		} else {
+			slogLogger.Error("listener_failed",
+				"port", port,
+				"error", err.Error(),
+				"action", "retry",
+			)
 		}
-		slogLogger.Error("listener_failed",
+		// D-16: a port that is busy at start-up used to stay dark for the
+		// life of the process, while the partial-bind banner promised a
+		// retry. Report it once through the conflict scan (security.log),
+		// then keep retrying until it frees up or the run ends.
+		pm.MarkLost(port)
+		var attempts int
+		listener, attempts, err = retryBind(ctx, bindListener)
+		if err != nil {
+			return nil // shutdown while the port was still unavailable
+		}
+		slogLogger.Info("listener_bound_after_retry",
 			"port", port,
-			"error", err.Error(),
-			"action", "skip_port",
+			"attempts", attempts,
 		)
-		return fmt.Errorf("port %d: %w", port, err)
 	}
 	// Closure so a mid-loop listener rebind is what gets closed at exit.
 	defer func() { listener.Close() }()
@@ -1021,6 +1043,24 @@ func listenPort(
 			stats.throttled.Add(1)
 			conn.Close()
 		}
+	}
+}
+
+// retryBind retries a failed initial bind with the accept backoff (100 ms
+// doubling to 10 s) until it succeeds or ctx ends. It returns the listener
+// and the number of retries it took, or ctx's error.
+func retryBind(ctx context.Context, bind func() (net.Listener, error)) (net.Listener, int, error) {
+	backoff := acceptBackoffInitial
+	for attempts := 1; ; attempts++ {
+		select {
+		case <-ctx.Done():
+			return nil, attempts - 1, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if l, err := bind(); err == nil {
+			return l, attempts, nil
+		}
+		backoff = min(backoff*2, acceptBackoffMax)
 	}
 }
 

@@ -1471,3 +1471,110 @@ func TestFlushThrottled_ClaimsDeltaOnce(t *testing.T) {
 		t.Errorf("count = %d, want 7", ev.Count)
 	}
 }
+
+// ── D-16: a port busy at start-up is retried, not abandoned ───────────────
+
+// pollUntil waits for cond with a bounded poll instead of a fixed sleep.
+func pollUntil(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting for %s", timeout, what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestListenPort_RetriesPortBusyAtStartup(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := blocker.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.Config{Capture: config.CaptureConfig{ReadTimeoutSec: 1, MaxPayloadSize: 1024}}
+	log, err := logger.New(t.TempDir(), "retry.log", 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	var stats statsCounters
+	pm := portscan.NewPortManager(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- listenPort(ctx, port, cfg, pm, log, &stats, newConnectionTracker(4),
+			newHitReporter(io.Discard), newFairnessLimiter(0, 0))
+	}()
+
+	pollUntil(t, "the first bind attempt", 5*time.Second, func() bool { return stats.bindAttempts.Load() == 1 })
+	if n := pm.ListeningCount(); n != 0 {
+		t.Fatalf("listening on a port another process holds: count=%d", n)
+	}
+	if lost := pm.DetectConflicts(); len(lost) != 1 || lost[0] != port {
+		t.Fatalf("busy port not reported to the conflict scan: %v", lost)
+	}
+	if got := stats.errors.Load(); got != 1 {
+		t.Fatalf("errors = %d, want 1 for the failed initial bind", got)
+	}
+
+	blocker.Close() // the other process lets go of the port
+	pollUntil(t, "the retried bind", 5*time.Second, func() bool { return pm.ListeningCount() == 1 })
+
+	c, err := net.DialTimeout("tcp", listenAddress(port), 2*time.Second)
+	if err != nil {
+		t.Fatalf("retried listener does not accept: %v", err)
+	}
+	c.Close()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("listenPort returned error on shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("listenPort did not return after ctx cancel")
+	}
+}
+
+func TestListenPort_StopsRetryingOnShutdown(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	port := blocker.Addr().(*net.TCPAddr).Port
+
+	log, err := logger.New(t.TempDir(), "retry.log", 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	var stats statsCounters
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- listenPort(ctx, port, &config.Config{}, portscan.NewPortManager(nil), log, &stats,
+			newConnectionTracker(4), newHitReporter(io.Discard), newFairnessLimiter(0, 0))
+	}()
+	pollUntil(t, "the first bind attempt", 5*time.Second, func() bool { return stats.bindAttempts.Load() == 1 })
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("listenPort returned %v on shutdown, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a retrying listener did not return after ctx cancel")
+	}
+}

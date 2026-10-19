@@ -151,6 +151,11 @@ Ports are selected from configured ranges, then **excluded** if:
 2. In the ephemeral range (read from `/proc/sys/net/ipv4/ip_local_port_range`)
 3. Listed in the `exclude` config
 
+A target that still fails to bind at start-up (taken in the meantime, or a privileged port without
+`CAP_NET_BIND_SERVICE`) is logged as `listener_failed` with `action: retry`, reported once in
+`security.log` as `conflict_detected`, and retried in the background with backoff (100 ms doubling to
+10 s) until it binds (`listener_bound_after_retry`) or the sensor stops.
+
 ## Resource Limits
 
 fuzzpot is designed to be invisible. The systemd service enforces:
