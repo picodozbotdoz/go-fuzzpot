@@ -414,6 +414,8 @@ type app struct {
 	// lastThrottleFlush is the throttled count already written to the
 	// security log in aggregate (R2-G9); drain flushes the final delta.
 	lastThrottleFlush atomic.Int64
+	// throttleRetry holds rejections whose aggregate write failed (D-23).
+	throttleRetry atomic.Int64
 }
 
 // flushThrottled writes the throttled delta accumulated since the previous
@@ -429,17 +431,35 @@ func (a *app) flushThrottled() int64 {
 	if a.secLog == nil {
 		return 0
 	}
+	var delta int64
 	for {
 		last := a.lastThrottleFlush.Load()
 		cur := a.stats.throttled.Load()
 		if cur <= last {
-			return 0
+			break
 		}
 		if a.lastThrottleFlush.CompareAndSwap(last, cur) {
-			a.secLog.LogThrottledBulk(int(cur - last))
-			return cur - last
+			delta = cur - last
+			break
 		}
 	}
+	// D-23: the write error used to be ignored after the delta was claimed,
+	// so a failed write lost those rejections from the audit log for good.
+	// They now wait in throttleRetry for the next flush.
+	delta += a.throttleRetry.Swap(0)
+	if delta == 0 {
+		return 0
+	}
+	if err := a.secLog.LogThrottledBulk(int(delta)); err != nil {
+		a.throttleRetry.Add(delta)
+		slogLogger.Error("security_log_write_failed",
+			"event", "connection_throttled",
+			"count", delta,
+			"error", err.Error(),
+		)
+		return 0
+	}
+	return delta
 }
 
 // newApp builds the run-time state and resolves the target port list. The
@@ -822,7 +842,15 @@ func (a *app) checkConflicts() {
 	if len(conflicts) == 0 {
 		return
 	}
-	a.secLog.LogConflict(conflicts)
+	if err := a.secLog.LogConflict(conflicts); err != nil {
+		// The ports still reach stderr and slog below; the scan cleared
+		// them, and re-marking them lost could unmark a listener that
+		// has since rebound.
+		slogLogger.Error("security_log_write_failed",
+			"event", "conflict_detected",
+			"error", err.Error(),
+		)
+	}
 	fmt.Fprintf(os.Stderr, "  [!] %d listener(s) lost, rebind pending: %v\n",
 		len(conflicts), conflicts)
 	slogLogger.Warn("port_conflicts_detected",

@@ -46,7 +46,7 @@ func NewSecurityLogger(dir string) (*SecurityLogger, error) {
 // Kept for low-rate, attributable rejections (tests, manual runs). The
 // accept path must not call it: per-event I/O with attacker-controlled
 // volume stalls the listener (G7) — use LogThrottledBulk from a reporter.
-func (sl *SecurityLogger) LogThrottled(remoteAddr string, port int) {
+func (sl *SecurityLogger) LogThrottled(remoteAddr string, port int) error {
 	event := SecurityEvent{
 		EventType:  EventThrottled,
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
@@ -54,15 +54,18 @@ func (sl *SecurityLogger) LogThrottled(remoteAddr string, port int) {
 		Port:       port,
 		Sensor:     sl.Sensor,
 	}
-	sl.WriteEventTyped(event)
+	return sl.WriteEventTyped(event)
 }
 
 // LogThrottledBulk records that count connections were rejected between
 // reporter ticks. Aggregate-only on purpose: under flood the accept loop
 // only increments a counter and this write happens off that path (G7).
-func (sl *SecurityLogger) LogThrottledBulk(count int) {
+//
+// Every Log* method returns the write error (D-23); the caller owns the
+// count and must keep it when the write fails.
+func (sl *SecurityLogger) LogThrottledBulk(count int) error {
 	if count <= 0 {
-		return
+		return nil
 	}
 	event := SecurityEvent{
 		EventType: EventThrottled,
@@ -70,16 +73,16 @@ func (sl *SecurityLogger) LogThrottledBulk(count int) {
 		Count:     count,
 		Sensor:    sl.Sensor,
 	}
-	sl.WriteEventTyped(event)
+	return sl.WriteEventTyped(event)
 }
 
 // LogConflict logs a port conflict detection event.
-func (sl *SecurityLogger) LogConflict(ports []int) {
+func (sl *SecurityLogger) LogConflict(ports []int) error {
 	event := SecurityEvent{
 		EventType: EventConflictDetect,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Ports:     ports,
 		Sensor:    sl.Sensor,
 	}
-	sl.WriteEventTyped(event)
+	return sl.WriteEventTyped(event)
 }

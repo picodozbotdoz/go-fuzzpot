@@ -312,7 +312,9 @@ func TestSecurityLogger_LogThrottled(t *testing.T) {
 	}
 	defer secLog.Close()
 
-	secLog.LogThrottled("192.168.1.1:54321", 8080)
+	if err := secLog.LogThrottled("192.168.1.1:54321", 8080); err != nil {
+		t.Fatal(err)
+	}
 
 	content, err := os.ReadFile(secLog.Path())
 	if err != nil {
@@ -347,7 +349,9 @@ func TestSecurityLogger_LogConflict(t *testing.T) {
 	defer secLog.Close()
 
 	conflicts := []int{80, 443, 8080}
-	secLog.LogConflict(conflicts)
+	if err := secLog.LogConflict(conflicts); err != nil {
+		t.Fatal(err)
+	}
 
 	content, err := os.ReadFile(secLog.Path())
 	if err != nil {

@@ -1227,8 +1227,12 @@ func TestLogThrottledBulkAggregates(t *testing.T) {
 	defer sl.Close()
 	sl.Sensor = "edge-test-1"
 
-	sl.LogThrottledBulk(500)
-	sl.LogThrottledBulk(0) // no-op, must not emit
+	if err := sl.LogThrottledBulk(500); err != nil {
+		t.Fatal(err)
+	}
+	if err := sl.LogThrottledBulk(0); err != nil { // no-op, must not emit
+		t.Fatal(err)
+	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "security.log"))
 	if err != nil {
@@ -1625,5 +1629,33 @@ func TestReopenLogsSkipsAnUnattachedLogger(t *testing.T) {
 
 	if err := log.WriteRaw("after reopen"); err != nil {
 		t.Fatalf("payload log unusable after reopen: %v", err)
+	}
+}
+
+// ── D-23: a failed security-log write must not lose the throttle count ────
+
+func TestFlushThrottled_FailedWriteIsRetried(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+	a.stats.throttled.Store(5)
+
+	a.secLog.Close() // every write now fails with ErrLoggerClosed
+	if got := a.flushThrottled(); got != 0 {
+		t.Fatalf("flush reported %d rejections although the write failed", got)
+	}
+
+	if err := a.secLog.Reopen(); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.flushThrottled(); got != 5 {
+		t.Fatalf("retry flushed %d, want the 5 the failed write did not record", got)
+	}
+	data, err := os.ReadFile(a.secLog.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ev logger.SecurityEvent
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &ev); err != nil || ev.Count != 5 {
+		t.Fatalf("security log = %q (err %v), want one aggregate with count 5", data, err)
 	}
 }
