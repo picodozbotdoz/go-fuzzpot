@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -1576,5 +1577,30 @@ func TestListenPort_StopsRetryingOnShutdown(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("a retrying listener did not return after ctx cancel")
+	}
+}
+
+// ── D-21: the handler cap leaves room for the listeners' descriptors ──────
+
+func TestHandlerCapReservesListenerDescriptors(t *testing.T) {
+	for _, tc := range []struct {
+		limit     uint64
+		listeners int
+		want      int
+	}{
+		{16384, 4000, 4096}, // shipped unit: (16384-4064)/2 = 6160, clamped
+		{8192, 4000, 2064},  // was 4096: 4096 handlers + 4000 listeners > 8192
+		{4096, 4000, 100},   // nothing left: the floor, and maxConnections warns
+		{1024, 0, 480},
+		{1 << 20, 0, 4096},
+		{math.MaxUint64, 4000, 4096}, // RLIM_INFINITY
+	} {
+		if got := handlerCap(tc.limit, tc.listeners); got != tc.want {
+			t.Errorf("handlerCap(%d, %d) = %d, want %d", tc.limit, tc.listeners, got, tc.want)
+		}
+	}
+	// Whatever the limit, handlers plus listeners must fit when it allows them to.
+	if got := handlerCap(8192, 4000); got+4000+fdReserve > 8192 {
+		t.Errorf("handlers (%d) + listeners exceed the limit", got)
 	}
 }

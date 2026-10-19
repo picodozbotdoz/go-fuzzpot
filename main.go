@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -456,11 +457,57 @@ func newApp(cfg *config.Config, ranges [][2]int) (*app, []int) {
 		// Connection limiter — prevents goroutine explosion under flood.
 		// Sized from the fd limit so a DoS cannot exhaust every descriptor,
 		// then bounded again by an estimated-memory budget (G3).
-		conns: newConnectionTracker(maxConnections(),
+		conns: newConnectionTracker(maxConnections(len(targets)),
 			withByteBudget(int64(cfg.Limits.MemoryBudgetMB)<<20, handlerReservation(cfg))),
 		fair: newFairnessLimiter(cfg.Limits.MaxPerPort, cfg.Limits.MaxPerIP),
 		hits: newHitReporter(os.Stderr),
 	}, targets
+}
+
+const (
+	// fdReserve is the descriptors kept back for everything that is neither
+	// a handler nor a listener: the two log files, stdio, netstat/sysctl
+	// pipes and the Go runtime.
+	fdReserve = 64
+	// minHandlers and maxHandlers clamp the fd-derived handler cap.
+	minHandlers = 100
+	maxHandlers = 4096
+)
+
+// maxConnections sizes the handler cap from the soft fd limit, after the
+// listeners' own descriptors (D-21), and warns when the limit is too low
+// for this many listeners.
+func maxConnections(listeners int) int {
+	limit, ok := fdSoftLimit()
+	if !ok {
+		return fallbackConnections
+	}
+	if need := uint64(listeners + fdReserve + 2*minHandlers); limit < need {
+		fmt.Fprintf(os.Stderr, "  [!] WARNING: soft RLIMIT_NOFILE is %d but %d listeners need about %d; "+
+			"raise LimitNOFILE or accepts will fail with EMFILE\n", limit, listeners, need)
+	}
+	return handlerCap(limit, listeners)
+}
+
+// handlerCap is half of the descriptors that the listeners and fdReserve
+// leave, clamped to [minHandlers, maxHandlers].
+//
+// D-21: the cap used to be half the whole limit. With about 4000 listeners
+// holding descriptors, a soft limit of 8192 gave 4096 handlers and 8096+
+// descriptors in use, so under load accepts failed with EMFILE.
+func handlerCap(softLimit uint64, listeners int) int {
+	if softLimit > math.MaxInt32 {
+		softLimit = math.MaxInt32 // RLIM_INFINITY must not wrap negative in int64
+	}
+	free := int64(softLimit) - int64(listeners) - fdReserve
+	n := free / 2
+	if n < minHandlers {
+		return minHandlers
+	}
+	if n > maxHandlers {
+		return maxHandlers
+	}
+	return int(n)
 }
 
 // handlerReservation estimates the peak memory of one handler: the read

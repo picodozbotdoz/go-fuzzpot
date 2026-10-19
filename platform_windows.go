@@ -19,9 +19,12 @@ func healthSignals() []os.Signal {
 	return nil
 }
 
-// maxConnections returns the concurrency cap on Windows, where the soft
+// fallbackConnections is the handler cap on Windows, where the soft
 // file-descriptor limit is not queryable via Getrlimit. 4096 matches the
 // upper clamp applied on Unix platforms.
-func maxConnections() int {
-	return 4096
+const fallbackConnections = 4096
+
+// fdSoftLimit reports no limit on Windows (see fallbackConnections).
+func fdSoftLimit() (uint64, bool) {
+	return 0, false
 }

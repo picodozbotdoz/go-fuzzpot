@@ -22,19 +22,19 @@ func healthSignals() []os.Signal {
 	return []os.Signal{syscall.SIGUSR1}
 }
 
-// maxConnections derives the concurrency cap from the soft file-descriptor
-// limit: half of the limit, clamped to [100, 4096].
-func maxConnections() int {
+// fallbackConnections is the handler cap when the fd limit cannot be read.
+const fallbackConnections = 256
+
+// fdSoftLimit reports the soft RLIMIT_NOFILE, if it can be read.
+func fdSoftLimit() (uint64, bool) {
 	var rlimit unix.Rlimit
-	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit); err == nil && rlimit.Cur > 0 {
-		n := int(rlimit.Cur / 2) // Use half of available FDs
-		if n < 100 {
-			return 100 // Minimum safe value
-		}
-		if n > 4096 {
-			return 4096 // Cap at reasonable default
-		}
-		return n
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit); err != nil {
+		return 0, false
 	}
-	return 256 // Conservative default if we can't determine limit
+	// Cur is uint64 on Linux and int64 on the BSDs.
+	cur := uint64(rlimit.Cur)
+	if cur == 0 {
+		return 0, false
+	}
+	return cur, true
 }
