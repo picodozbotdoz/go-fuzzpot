@@ -17,7 +17,7 @@ Companion file: `repo/fuzz-sec-intel/docs/ROADMAP_1017.md` (sections B0–B4 + C
 
 ### A1 — Reliability & observability
 
-- [ ] **A1-6 Graceful shutdown** — WaitGroup over `handleConnection` goroutines with a bounded drain window, `Sync()` the payload log before exit (today in-flight payloads are lost and writes can hit a closed file).
+- [x] **A1-6 Graceful shutdown** — WaitGroup over `handleConnection` goroutines with a bounded drain window, `Sync()` the payload log before exit (today in-flight payloads are lost and writes can hit a closed file). ✅ Closed by D-3 (`6e90096`): listeners → handlers → `Sync()` → close, with a bounded grace period and a loud timeout event. Verified behaviourally in run-3 by `TestTwoPortLoopbackSmoke`, which cancels mid-flight and asserts the JSONL is complete and synced.
 - [x] **A1-7 Rotation overhaul** (logger.go:122-208) — optional gzip archive instead of straight delete; fix same-second rotation collisions overwriting the earlier backup; move the 50 MB copy out of the logger mutex (all logging currently stalls); optional fsync knob. **Cross-repo: coordinate with B1-7** — prefer rename-based rotation; sec-intel's parser must handle it without loss. ✅ 2026-10-18: rename-based rotation primary (O(1) under the write mutex — the copy only remains as cross-device fallback), same-second collisions get `-N` suffix, optional `logging.compress` + `compress_delay_sec` (60 s default, giving the analyzer's drain window) gzip archive, optional `logging.fsync_writes`, prune counts `.gz` files, `NewWithOptions` API. Windows fix found: gzip path must close the source before removing it. Contract test pairs with sec-intel `TestRotationSafety`.
 - [ ] **A1-8 Prometheus metrics endpoint** — localhost-only, stdlib `net/http` (no new deps): connections, payloads, bytes, throttled, errors, per-port top-N, listener failures, rotations.
 - [ ] **A1-9 Zero-byte connection events** — opt-in config, default off: pure port scans currently produce no record at all.
@@ -59,6 +59,10 @@ Companion file: `repo/fuzz-sec-intel/docs/ROADMAP_1017.md` (sections B0–B4 + C
 - [ ] **D-11 Config validation gaps** (found 2026-10-18, review): non-strict YAML hides typos, unbounded `max_payload_size`, unvalidated `logging.dir`/`file` (`config/config.go:93,126-128`).
 - [ ] **D-12 Throttle path blocks accept** (found 2026-10-18, review): mutex + write + rotation check on the accept goroutine, attacker-controlled volume (`main.go:692`).
 
+- [x] **D-13 Throttle delta can be logged twice** (found 2026-10-19, run-3 review): `reportStats` claimed the delta with a plain `Store` after writing it while `drain` used `CompareAndSwap`; when both ran in the same tick the same rejections were written to `security.log` twice — an audit trail that overcounts exactly during a flood. ✅ `1000205` — one `flushThrottled()` helper, CAS-only, used by the ticker and the shutdown path; `TestFlushThrottled_ClaimsDeltaOnce` drives 8 concurrent flushes and asserts one line with the exact count.
+- [x] **D-14 CI lint job could never pass** (found 2026-10-19, run-3 review): `golangci-lint v1.61` was built with Go 1.23 and refuses a module targeting go 1.25, so the job failed before analysing anything; `--disable-all` no longer exists in v2. ✅ `f2832cc` — action v9 + linter v2.15.0 + `--default=none`.
+- [ ] **D-15 Two CI gaps left** (found 2026-10-19, run-3 review): (a) the race lane only runs on Linux — correct, but `go test -race` is never run against the `portscan` build-tag variants that only exist on other OSes; (b) `install.sh` ships a unit with `CapabilityBoundingSet=` empty, so a config that includes a privileged port (22/80/443) fails to bind with `EACCES` and the operator sees only a per-port error. Add a `README`/unit note, or an `AmbientCapabilities=CAP_NET_BIND_SERVICE` opt-in.
+
 ## Benchmarks
 
 _(record capture/sec numbers per release here as A3-16 lands)_
@@ -73,3 +77,4 @@ _(record capture/sec numbers per release here as A3-16 lands)_
 
 - 2026-10-18 (B1-8 cross-repo, landed): `v:1` field in every LogEntry; contract/log_schema.json + sample fixture byte-identical in both repos; contract tests run under both gates.
 - 2026-10-18 (review): appended D-2..D-12 from `outputs/engineering/PROJECT_REVIEW_2026-10-18.md`; marked A1-11 invalid as written (superseded by D-2) and A1-6 closable via D-3. No items deleted.
+- 2026-10-19 (run-3): ticked A1-6 (D-3 shipped it); appended D-13 (throttle double-count, fixed), D-14 (CI linter, fixed), D-15 (CI/unit gaps, open). Verification: `gofmt -l` empty, `go vet` clean, `go test ./...` green, four cross-builds OK, `--dry-run` exit 0.
