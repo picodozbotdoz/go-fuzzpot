@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1261,5 +1264,201 @@ func TestAppRun_EarlyCancelIsNotABindFailure(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("run() did not return")
+	}
+}
+
+// freeLoopbackPorts reserves n distinct loopback ports and releases them so
+// listenPort can bind them. The reservation/listen gap is a TOCTOU window, but
+// it is the only way to feed a concrete port number to the production
+// listenPort signature, and a lost race just fails this test loudly.
+func freeLoopbackPorts(t *testing.T, n int) []int {
+	t.Helper()
+	ports := make([]int, 0, n)
+	seen := map[int]bool{}
+	for len(ports) < n {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve loopback port: %v", err)
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		ln.Close()
+		if !seen[p] {
+			seen[p] = true
+			ports = append(ports, p)
+		}
+	}
+	return ports
+}
+
+// TestTwoPortLoopbackSmoke drives the production path end to end on two
+// loopback ports at once: listenPort -> accept loop -> handleConnection ->
+// JSONL. The contract fields are asserted on the bytes that actually reach the
+// file, not on a struct the test assembled itself. TestMain pins listenHost to
+// 127.0.0.1, so this never triggers a Windows Firewall prompt.
+func TestTwoPortLoopbackSmoke(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	tmpDir := t.TempDir()
+
+	log, err := logger.New(tmpDir, "payloads.log", 10, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	cfg := &config.Config{
+		Capture: config.CaptureConfig{
+			ReadTimeoutSec: 2,
+			MaxPayloadSize: 65536,
+			LogHexPayload:  true,
+		},
+	}
+	pm := portscan.NewPortManager(nil)
+	conns := newConnectionTracker(8)
+	var stats statsCounters
+	hits := newHitReporter(io.Discard)
+	fair := newFairnessLimiter(0, 0)
+
+	ports := freeLoopbackPorts(t, 2)
+	payloads := [][]byte{
+		[]byte("SSH-2.0-libssh_0.9.6\r\n"),
+		[]byte("GET /admin HTTP/1.1\r\nHost: honeypot\r\n\r\n"),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var listeners sync.WaitGroup
+	for _, p := range ports {
+		listeners.Add(1)
+		go func(port int) {
+			defer listeners.Done()
+			_ = listenPort(ctx, port, cfg, pm, log, &stats, conns, hits, fair)
+		}(p)
+	}
+
+	// Wait for both binds, then send one distinct payload to each port.
+	deadline := time.Now().Add(5 * time.Second)
+	for pm.ListeningCount() < 2 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("only %d of 2 listeners came up", pm.ListeningCount())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	for i, p := range ports {
+		c, derr := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if derr != nil {
+			cancel()
+			t.Fatalf("dial port %d: %v", p, derr)
+		}
+		if _, werr := c.Write(payloads[i]); werr != nil {
+			c.Close()
+			cancel()
+			t.Fatalf("write to port %d: %v", p, werr)
+		}
+		c.Close()
+	}
+
+	// The handler closes on client EOF, so wait for two completed events.
+	for stats.payloads.Load() < 2 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("captured %d of 2 payloads", stats.payloads.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	listeners.Wait()
+	if err := log.Sync(); err != nil {
+		t.Fatalf("sync payload log: %v", err)
+	}
+
+	data, err := os.ReadFile(log.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("payload log has %d line(s), want 2:\n%s", len(lines), data)
+	}
+
+	gotPorts := map[int]bool{}
+	for _, line := range lines {
+		var e LogEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("invalid JSON line %q: %v", line, err)
+		}
+		gotPorts[e.DestPort] = true
+
+		if e.V != 2 {
+			t.Errorf("v = %d, want 2 (schema version)", e.V)
+		}
+		if _, terr := time.Parse(time.RFC3339Nano, e.Timestamp); terr != nil {
+			t.Errorf("ts %q is not RFC3339Nano: %v", e.Timestamp, terr)
+		}
+		if e.SourceIP != "127.0.0.1" {
+			t.Errorf("src_ip = %q, want 127.0.0.1", e.SourceIP)
+		}
+		raw, herr := hex.DecodeString(e.Hex)
+		if herr != nil {
+			t.Fatalf("hex %q is not decodable: %v", e.Hex, herr)
+		}
+		if e.Size != len(raw) {
+			t.Errorf("size = %d, want %d (decoded hex length)", e.Size, len(raw))
+		}
+		sum := sha256.Sum256(raw)
+		if e.PayloadSHA256 != fmt.Sprintf("%x", sum) {
+			t.Errorf("payload_sha256 = %q, want %x", e.PayloadSHA256, sum)
+		}
+		if e.Truncated {
+			t.Errorf("truncated = true for a %d-byte payload under the 64 KB cap", e.Size)
+		}
+	}
+	for _, p := range ports {
+		if !gotPorts[p] {
+			t.Errorf("no event recorded for port %d (got %v)", p, gotPorts)
+		}
+	}
+}
+
+// flushThrottled must report each rejected connection exactly once, even when
+// the stats ticker and shutdown flush concurrently. A plain Store let both
+// paths claim the same delta and write duplicate aggregate lines to the audit
+// log under flood.
+func TestFlushThrottled_ClaimsDeltaOnce(t *testing.T) {
+	slogLogger = defaultSlogLogger()
+	a := newTestApp(t, &config.Config{}, nil)
+
+	a.stats.throttled.Store(7)
+
+	var wg sync.WaitGroup
+	var reported atomic.Int64
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reported.Add(a.flushThrottled())
+		}()
+	}
+	wg.Wait()
+
+	if got := reported.Load(); got != 7 {
+		t.Fatalf("flushes reported %d rejections in total, want exactly 7", got)
+	}
+
+	data, err := os.ReadFile(a.secLog.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("security log has %d line(s), want 1 (no duplicate aggregate):\n%s", len(lines), data)
+	}
+	var ev logger.SecurityEvent
+	if err := json.Unmarshal([]byte(lines[0]), &ev); err != nil {
+		t.Fatalf("invalid security event: %v", err)
+	}
+	if ev.Count != 7 {
+		t.Errorf("count = %d, want 7", ev.Count)
 	}
 }

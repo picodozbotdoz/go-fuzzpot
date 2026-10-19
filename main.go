@@ -409,6 +409,32 @@ type app struct {
 	lastThrottleFlush atomic.Int64
 }
 
+// flushThrottled writes the throttled delta accumulated since the previous
+// flush to the security log and returns the number of rejections reported.
+//
+// The counter is claimed with CompareAndSwap rather than a plain Store so the
+// stats ticker and the shutdown path cannot both report the same delta. They
+// used to: the ticker stored the new value unconditionally after reading it,
+// so a shutdown that claimed the delta first between those two operations
+// produced a second, identical aggregate line — an audit log that overcounts
+// rejections exactly when the sensor is under attack.
+func (a *app) flushThrottled() int64 {
+	if a.secLog == nil {
+		return 0
+	}
+	for {
+		last := a.lastThrottleFlush.Load()
+		cur := a.stats.throttled.Load()
+		if cur <= last {
+			return 0
+		}
+		if a.lastThrottleFlush.CompareAndSwap(last, cur) {
+			a.secLog.LogThrottledBulk(int(cur - last))
+			return cur - last
+		}
+	}
+}
+
 // newApp builds the run-time state and resolves the target port list. The
 // loggers are attached later, once a real run has been decided: --dry-run must
 // not open log files.
@@ -615,18 +641,13 @@ func (a *app) waitForBindSweep(ctx context.Context) {
 // aggregate. The accept path only increments a counter; doing per-event log
 // I/O there let a flood stall the listener.
 func (a *app) reportStats(ctx context.Context, ticker *time.Ticker) {
-	lastThrottled := int64(0)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s := a.stats.snapshot()
-			if s.throttled > lastThrottled && a.secLog != nil {
-				a.secLog.LogThrottledBulk(int(s.throttled - lastThrottled))
-				a.lastThrottleFlush.Store(s.throttled)
-				lastThrottled = s.throttled
-			}
+			a.flushThrottled()
 			listening := a.pm.ListeningCount()
 			fmt.Fprintf(os.Stderr, "  [stats] listening:%d  connections:%d  payloads:%d  zero-byte:%d  errors:%d  accept-errors:%d  rebinds:%d  throttled:%d  rotations:%d  log-bytes:%d\n",
 				listening, s.connections, s.payloads, s.zeroByte, s.errors,
@@ -693,19 +714,9 @@ func (a *app) drain(listeners *sync.WaitGroup) {
 
 	// R2-G9: flush the final throttled delta — the security log otherwise
 	// undercounts rejections by up to one stats interval after a flood
-	// followed by a quick shutdown.
-	if a.secLog != nil {
-		for {
-			last := a.lastThrottleFlush.Load()
-			cur := a.stats.throttled.Load()
-			if cur <= last {
-				break
-			}
-			if a.lastThrottleFlush.CompareAndSwap(last, cur) {
-				a.secLog.LogThrottledBulk(int(cur - last))
-			}
-		}
-	}
+	// followed by a quick shutdown. flushThrottled claims the delta
+	// atomically, so a stats tick racing with shutdown cannot log it twice.
+	a.flushThrottled()
 
 	// Flush the final rotation window before the deferred Close runs.
 	if err := a.log.Sync(); err != nil {
